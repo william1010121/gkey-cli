@@ -1,0 +1,62 @@
+# Secrets and local credentials
+.env
+.env.*
+*.env
+secrets/
+.secrets/
+credentials/
+.credentials/
+*credentials*.json
+*credentials*.yaml
+*credentials*.yml
+*credentials*.toml
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python environments and caches
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+.cache/
+cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Model files and downloaded data
+models/
+model/
+checkpoints/
+*.safetensors
+*.gguf
+*.ggml
+*.pt
+*.pth
+*.onnx
+*.ckpt
+*.bin
+
+# Input documents and generated translation output
+*.[pP][dD][fF]
+output/
+outputs/
+translated/
+translations/
+translation_output/
+translation_outputs/
+*.translated.*
+*.dual.*
+*.mono.*
+
+# Local runtime files
+*.log
+*.pid
+.DS_Store
+
+node_modules/
+*.tgz

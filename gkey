@@ -1,0 +1,345 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+GKEY_DIR="/Users/guoshengwei/other/ai-skill-research/gkey"
+PYTHON_BIN="${GKEY_DIR}/.venv/bin/python"
+SERVER_SCRIPT="${GKEY_DIR}/server.py"
+CATALOG_SCRIPT="${GKEY_DIR}/catalog.py"
+
+PORT="${GKEY_PORT:-18432}"
+HOST="${GKEY_HOST:-127.0.0.1}"
+MODEL="${GKEY_MODEL:-gemini-3.8-flash-low}"
+BACKEND="${GKEY_BACKEND:-auto}"
+EFFORT="${GKEY_EFFORT:-low}"
+POOL_SIZE="${GKEY_POOL_SIZE:-4}"
+
+PID_FILE="/tmp/gkey-proxy-${PORT}.pid"
+LOG_FILE="/tmp/gkey-proxy-${PORT}.log"
+
+export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/go/bin:$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
+
+usage() {
+  cat <<EOF
+Usage:
+  gkey                                  開啟互動式 fzf 工具選單（含用法預覽、自動安裝與直接執行）
+  gkey [options] <command> [args...]    零配置直接執行任意 OpenAI CLI 工具（未安裝會自動安裝並補齊參數！）
+
+Zero-Config Examples (不需手打 -s openai 或 --base-url):
+  gkey pdf2zh paper.pdf                 論文雙語 PDF 翻譯（自動注入 -s openai -t 2）
+  gkey babeldoc paper.pdf               次世代 PDF 雙語排版翻譯
+  gkey markitdown input.pdf -o out.md   微軟萬用文件轉 Markdown
+  gkey marker_single paper.pdf          複雜表格/數學掃描 PDF 轉 Markdown（自動開啟 LLM 校正）
+  gkey gpt-subtrans movie.srt -o zh.srt 字幕檔上下文翻譯成繁體中文
+  gkey bbook_maker book.epub --test     雙語 EPUB 電子書製作（自動補齊 API 參數）
+  gkey ai-renamer ~/Desktop/screenshots 看圖/看 PDF 內容批次自動改檔名
+  cat log.txt | gkey mods "分析根因"     Charmbracelet 終端機管線神器
+  cat note.md | gkey fabric -p summarize Fabric 數百種 Prompt Pattern 管線處理
+  gkey oco                              自動分析 git staged diff 產生 Commit Message
+  gkey gptcommit                        Rust 極速版 Git Commit Message 產生器
+  gkey lobe-i18n                        自動批次翻譯專案多語系 JSON / Markdown
+
+Options (before <command>):
+  -m, --model <model>       切換底層 Antigravity 模型 (預設: ${MODEL})
+                            可選: gemini-3.8-flash-low, gemini-4-argon-medium,
+                                  claude-sonnet-5-5-medium, claude-opus-5-5-medium
+  -b, --backend <mode>      後端引擎: auto | sdk | agy (預設: ${BACKEND})
+  -e, --effort <level>      推理強度: low | medium | high (預設: ${EFFORT})
+  -p, --port <port>         本地代理 Port (預設: ${PORT})
+
+Management flags:
+  --list                    列出內建支援的 14 款精選 CLI 工具與安裝狀態
+  --install <tool>          手動觸發安裝指定的精選工具
+  --status                  查看背景 Proxy 運行狀態
+  --start                   啟動背景 Proxy
+  --stop                    停止背景 Proxy
+  --restart                 重啟背景 Proxy
+  --logs                    查看背景 Proxy 即時日誌 (${LOG_FILE})
+  --env                     印出環境變數 export 指令
+EOF
+}
+
+is_running() {
+  curl -fsS --max-time 1 "http://${HOST}:${PORT}/health" >/dev/null 2>&1
+}
+
+stop_daemon() {
+  if [[ -f "${PID_FILE}" ]]; then
+    local pid
+    pid=$(cat "${PID_FILE}" 2>/dev/null || true)
+    if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+      kill "${pid}" 2>/dev/null || true
+      for _ in {1..20}; do
+        if ! kill -0 "${pid}" 2>/dev/null; then
+          break
+        fi
+        sleep 0.1
+      done
+    fi
+    rm -f "${PID_FILE}"
+  fi
+  local port_pids
+  port_pids=$(lsof -ti tcp:"${PORT}" 2>/dev/null || true)
+  if [[ -n "${port_pids}" ]]; then
+    kill ${port_pids} 2>/dev/null || true
+  fi
+}
+
+start_daemon() {
+  if is_running; then
+    return 0
+  fi
+
+  nohup "${PYTHON_BIN}" "${SERVER_SCRIPT}" \
+    --host "${HOST}" \
+    --port "${PORT}" \
+    --backend "${BACKEND}" \
+    --model "${MODEL}" \
+    --effort "${EFFORT}" \
+    --pool-size "${POOL_SIZE}" \
+    >"${LOG_FILE}" 2>&1 &
+
+  local pid=$!
+  echo "${pid}" >"${PID_FILE}"
+
+  local ready=0
+  for _ in {1..50}; do
+    if is_running; then
+      ready=1
+      break
+    fi
+    if ! kill -0 "${pid}" 2>/dev/null; then
+      echo "[gkey] Error: Proxy daemon exited unexpectedly. Logs:" >&2
+      cat "${LOG_FILE}" >&2
+      exit 1
+    fi
+    sleep 0.1
+  done
+
+  if [[ "${ready}" -ne 1 ]]; then
+    echo "[gkey] Error: Timed out waiting for proxy on http://${HOST}:${PORT}" >&2
+    exit 1
+  fi
+
+  for _ in {1..150}; do
+    local health_json
+    health_json=$(curl -fsS --max-time 1 "http://${HOST}:${PORT}/health" 2>/dev/null || echo "{}")
+    if echo "${health_json}" | grep -q '"active_engine":"sdk"'; then
+      break
+    fi
+    if ! echo "${health_json}" | grep -q '"warm_workers":0'; then
+      break
+    fi
+    sleep 0.2
+  done
+}
+
+interactive_fzf() {
+  if ! command -v fzf >/dev/null 2>&1 || [[ ! -t 0 ]] || [[ ! -t 1 ]]; then
+    echo "=== gkey 精選 14 款 OpenAI CLI 神器清單 ==="
+    "${PYTHON_BIN}" "${CATALOG_SCRIPT}" list
+    echo ""
+    usage
+    exit 0
+  fi
+
+  local selected
+  selected=$(
+    "${PYTHON_BIN}" "${CATALOG_SCRIPT}" list | fzf \
+      --ansi \
+      --delimiter=$'\t' \
+      --with-nth=2 \
+      --header="🚀 gkey 工具箱 (Model: ${MODEL}) │ Enter: 選擇並自動安裝/執行 │ Ctrl-I: 僅安裝 │ Esc: 離開" \
+      --preview="${PYTHON_BIN} ${CATALOG_SCRIPT} preview {1}" \
+      --preview-window="right:56%:wrap" \
+      --height="90%" \
+      --layout="reverse" \
+      --border="rounded" \
+      --prompt="🔍 搜尋工具 > " \
+      --bind="ctrl-i:execute(${PYTHON_BIN} ${CATALOG_SCRIPT} install {1})+reload(${PYTHON_BIN} ${CATALOG_SCRIPT} list)" \
+    || true
+  )
+
+  if [[ -z "${selected}" ]]; then
+    exit 0
+  fi
+
+  local tool_id
+  tool_id=$(echo "${selected}" | cut -f1 | tr -d ' ')
+
+  # Ensure installed first
+  "${PYTHON_BIN}" "${CATALOG_SCRIPT}" install "${tool_id}"
+
+  echo ""
+  "${PYTHON_BIN}" "${CATALOG_SCRIPT}" preview "${tool_id}"
+  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  local hint
+  hint=$("${PYTHON_BIN}" "${CATALOG_SCRIPT}" hint "${tool_id}")
+  echo -e "\033[1;36m👉 ${hint}\033[0m"
+  echo -e "\033[90m   (支援 Tab 補齊檔案路徑；若想查看該工具的 --help 請輸入 --help)\033[0m"
+
+  local user_args=""
+  read -e -r -p "gkey ${tool_id} " user_args || true
+
+  start_daemon
+
+  if [[ -n "${user_args}" ]]; then
+    # Use eval with array expansion so quoted args work naturally
+    eval "set -- ${user_args}"
+    exec "${PYTHON_BIN}" "${CATALOG_SCRIPT}" adapt "${PORT}" "${MODEL}" "${tool_id}" "$@"
+  else
+    exec "${PYTHON_BIN}" "${CATALOG_SCRIPT}" adapt "${PORT}" "${MODEL}" "${tool_id}"
+  fi
+}
+
+ACTION=""
+INSTALL_TARGET=""
+OVERRIDE_CONFIG=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -m|--model)
+      MODEL="$2"
+      OVERRIDE_CONFIG=1
+      shift 2
+      ;;
+    -b|--backend)
+      BACKEND="$2"
+      OVERRIDE_CONFIG=1
+      shift 2
+      ;;
+    -e|--effort)
+      EFFORT="$2"
+      OVERRIDE_CONFIG=1
+      shift 2
+      ;;
+    -p|--port)
+      PORT="$2"
+      PID_FILE="/tmp/gkey-proxy-${PORT}.pid"
+      LOG_FILE="/tmp/gkey-proxy-${PORT}.log"
+      shift 2
+      ;;
+    --list)
+      ACTION="list"
+      shift
+      ;;
+    --install)
+      ACTION="install"
+      INSTALL_TARGET="${2:-}"
+      shift 2
+      ;;
+    --status)
+      ACTION="status"
+      shift
+      ;;
+    --start)
+      ACTION="start"
+      shift
+      ;;
+    --stop)
+      ACTION="stop"
+      shift
+      ;;
+    --restart)
+      ACTION="restart"
+      shift
+      ;;
+    --logs)
+      ACTION="logs"
+      shift
+      ;;
+    --env)
+      ACTION="env"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      echo "[gkey] Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+case "${ACTION}" in
+  list)
+    "${PYTHON_BIN}" "${CATALOG_SCRIPT}" list
+    exit 0
+    ;;
+  install)
+    if [[ -z "${INSTALL_TARGET}" ]]; then
+      echo "Usage: gkey --install <tool_id>" >&2
+      exit 1
+    fi
+    "${PYTHON_BIN}" "${CATALOG_SCRIPT}" install "${INSTALL_TARGET}"
+    exit 0
+    ;;
+  status)
+    if is_running; then
+      echo "[gkey] Proxy is RUNNING at http://${HOST}:${PORT}/v1"
+      curl -fsS "http://${HOST}:${PORT}/health" && echo ""
+    else
+      echo "[gkey] Proxy is STOPPED (port ${PORT})"
+    fi
+    exit 0
+    ;;
+  start)
+    start_daemon
+    echo "[gkey] Proxy started at http://${HOST}:${PORT}/v1"
+    curl -fsS "http://${HOST}:${PORT}/health" && echo ""
+    exit 0
+    ;;
+  stop)
+    stop_daemon
+    echo "[gkey] Proxy stopped."
+    exit 0
+    ;;
+  restart)
+    stop_daemon
+    start_daemon
+    echo "[gkey] Proxy restarted at http://${HOST}:${PORT}/v1"
+    curl -fsS "http://${HOST}:${PORT}/health" && echo ""
+    exit 0
+    ;;
+  logs)
+    tail -n 100 -f "${LOG_FILE}"
+    exit 0
+    ;;
+  env)
+    cat <<EOF
+export OPENAI_BASE_URL="http://${HOST}:${PORT}/v1"
+export OPENAI_API_BASE="http://${HOST}:${PORT}/v1"
+export OPENAI_API_BASE_URL="http://${HOST}:${PORT}/v1"
+export OPENAI_PROXY_URL="http://${HOST}:${PORT}/v1"
+export OPENAI_API_KEY="gkey-local-placeholder"
+export OPENAI_MODEL="${MODEL}"
+EOF
+    exit 0
+    ;;
+esac
+
+# If no command provided, launch interactive fzf TUI!
+if [[ $# -eq 0 ]]; then
+  interactive_fzf
+  exit 0
+fi
+
+if [[ "${OVERRIDE_CONFIG}" -eq 1 ]] && is_running; then
+  CURRENT_HEALTH=$(curl -fsS --max-time 1 "http://${HOST}:${PORT}/health" 2>/dev/null || echo "{}")
+  if ! echo "${CURRENT_HEALTH}" | grep -q "\"default_model\":\"${MODEL}\""; then
+    stop_daemon
+  fi
+fi
+
+start_daemon
+
+exec "${PYTHON_BIN}" "${CATALOG_SCRIPT}" adapt "${PORT}" "${MODEL}" "$@"
