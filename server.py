@@ -17,15 +17,19 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import hashlib
 import json
 import logging
 import os
 import pathlib
+import random
+import re
 import shutil
 import sys
 import tempfile
 import time
 import uuid
+from collections import OrderedDict
 from typing import Any, AsyncIterator, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -87,6 +91,185 @@ DEFAULT_SYSTEM_PROMPT = (
     "Output ONLY the direct response requested by the user without conversational filler, "
     "markdown wrappers (unless requested), or explanations."
 )
+
+
+
+# ---- opt-in speed features: retries, response cache, coalescing ---------------------------------
+
+# Substrings (lower case) of error messages that look like transient backend trouble.
+TRANSIENT_MARKERS = (
+    "closed its output", "exited before init", "did not initialise", "connection reset",
+    "connection refused", "broken pipe", "temporarily", "temporary", "overloaded", "unavailable",
+    "rate limit", "rate_limit", "too many requests", "429", "500", "502", "503", "504",
+    "resource exhausted", "resource_exhausted", "internal error", "try again", "reset by peer",
+)
+PERMANENT_MARKERS = ("invalid", "unauthorized", "unauthenticated", "permission", "not installed", "not found", "api key")
+
+RETRY_BASE_DELAY = 0.5
+RETRY_MAX_DELAY = 8.0
+
+
+async def _sleep(seconds: float) -> None:  # separate function so tests can patch it
+    await asyncio.sleep(seconds)
+
+
+def is_transient_error(exc: BaseException) -> bool:
+    """Heuristic: is this backend failure worth retrying? Deadline timeouts are NOT retried."""
+    if isinstance(exc, (asyncio.CancelledError, TimeoutError, asyncio.TimeoutError)):
+        return False
+    if isinstance(exc, (ConnectionError, BrokenPipeError)):
+        return True
+    msg = str(exc).lower()
+    if any(m in msg for m in PERMANENT_MARKERS):
+        return False
+    return any(m in msg for m in TRANSIENT_MARKERS)
+
+
+def backoff_delay(attempt: int, base: float = RETRY_BASE_DELAY, cap: float = RETRY_MAX_DELAY) -> float:
+    """Exponential backoff with jitter (50-100% of base * 2**attempt, capped)."""
+    return min(cap, base * (2 ** attempt)) * random.uniform(0.5, 1.0)
+
+
+async def retrying_stream(
+    backend: Any,
+    retries: int,
+    on_retry: Any = None,
+    **kwargs: Any,
+) -> AsyncIterator[str]:
+    """backend.stream_chat with retries. Only retries while nothing has been yielded yet."""
+    attempt = 0
+    while True:
+        yielded = False
+        try:
+            async for delta in backend.stream_chat(**kwargs):
+                yielded = True
+                yield delta
+            return
+        except Exception as e:  # noqa: BLE001
+            if yielded or attempt >= retries or not is_transient_error(e):
+                raise
+            delay = backoff_delay(attempt)
+            attempt += 1
+            logger.warning("Transient backend error (%s); retry %d/%d in %.2fs", e, attempt, retries, delay)
+            if on_retry is not None:
+                on_retry()
+            await _sleep(delay)
+
+
+def cache_key(body: dict[str, Any], context: str) -> str:
+    """Stable key over model, messages and sampling params (stream/user flags excluded)."""
+    skip = {"stream", "stream_options", "user"}
+    payload = {k: v for k, v in body.items() if k not in skip}
+    payload["__ctx"] = context  # engine/default model/effort: never serve answers across them
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+class ResponseCache:
+    """Size-bounded LRU of response texts, optionally mirrored to disk. Errors are never stored."""
+
+    def __init__(
+        self,
+        max_entries: int = 512,
+        max_bytes: int = 32 * 1024 * 1024,
+        disk_dir: Optional[pathlib.Path] = None,
+        max_disk_bytes: int = 256 * 1024 * 1024,
+    ) -> None:
+        self.max_entries = max(1, max_entries)
+        self.max_bytes = max_bytes
+        self.disk_dir = disk_dir
+        self.max_disk_bytes = max_disk_bytes
+        self._mem: "OrderedDict[str, str]" = OrderedDict()
+        self._bytes = 0
+        self.hits = 0
+        self.misses = 0
+        self.coalesced = 0
+        if disk_dir is not None:
+            disk_dir.mkdir(parents=True, exist_ok=True)
+
+    def _disk_path(self, key: str) -> pathlib.Path:
+        assert self.disk_dir is not None
+        return self.disk_dir / f"{key}.txt"
+
+    def get(self, key: str) -> Optional[str]:
+        text = self._mem.get(key)
+        if text is not None:
+            self._mem.move_to_end(key)
+            return text
+        if self.disk_dir is not None:
+            try:
+                text = self._disk_path(key).read_text(encoding="utf-8")
+            except OSError:
+                return None
+            self._remember(key, text)
+            return text
+        return None
+
+    def _remember(self, key: str, text: str) -> None:
+        size = len(text.encode("utf-8"))
+        if size > self.max_bytes // 2:
+            return
+        old = self._mem.pop(key, None)
+        if old is not None:
+            self._bytes -= len(old.encode("utf-8"))
+        self._mem[key] = text
+        self._bytes += size
+        while self._mem and (len(self._mem) > self.max_entries or self._bytes > self.max_bytes):
+            _, ev = self._mem.popitem(last=False)
+            self._bytes -= len(ev.encode("utf-8"))
+
+    def put(self, key: str, text: str) -> None:
+        if not text or not text.strip():
+            return
+        self._remember(key, text)
+        if self.disk_dir is not None and len(text.encode("utf-8")) <= self.max_disk_bytes // 4:
+            try:
+                tmp = self.disk_dir / f"{key}.{os.getpid()}.tmp"
+                tmp.write_text(text, encoding="utf-8")
+                os.replace(tmp, self._disk_path(key))
+                self._trim_disk()
+            except OSError as e:
+                logger.warning("cache: disk write failed: %s", e)
+
+    def _trim_disk(self) -> None:
+        assert self.disk_dir is not None
+        files = []
+        total = 0
+        for p in self.disk_dir.glob("*.txt"):
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            files.append((st.st_mtime, st.st_size, p))
+            total += st.st_size
+        if total <= self.max_disk_bytes:
+            return
+        for _, size, p in sorted(files):
+            try:
+                p.unlink()
+            except OSError:
+                continue
+            total -= size
+            if total <= self.max_disk_bytes * 0.9:
+                break
+
+    def hit_rate(self) -> Optional[float]:
+        served = self.hits + self.coalesced
+        total = served + self.misses
+        return None if total == 0 else served / total
+
+    def stats(self) -> dict[str, Any]:
+        rate = self.hit_rate()
+        return {
+            "cache_enabled": True,
+            "cache_hits": self.hits,
+            "cache_misses": self.misses,
+            "cache_coalesced": self.coalesced,
+            "cache_hit_rate": None if rate is None else round(rate, 3),
+            "cache_entries": len(self._mem),
+            "cache_bytes": self._bytes,
+            "cache_disk": self.disk_dir is not None,
+        }
 
 
 def format_openai_messages(messages: list[dict[str, Any]]) -> tuple[str, str]:
@@ -583,7 +766,21 @@ def create_app(
     max_turns_per_worker: int,
     fake_backend: bool = False,
     fake_delay_ms: float = 20.0,
+    cache_enabled: bool = False,
+    cache_disk: bool = False,
+    retries: int = 0,
 ) -> Starlette:
+    retries = max(0, min(int(retries), 10))
+    cache: Optional[ResponseCache] = None
+    if cache_enabled:
+        cache = ResponseCache(
+            max_entries=int(os.environ.get("GKEY_CACHE_MAX_ENTRIES", "512")),
+            max_bytes=int(os.environ.get("GKEY_CACHE_MAX_BYTES", str(32 * 1024 * 1024))),
+            disk_dir=(gkey_home() / "cache") if cache_disk else None,
+            max_disk_bytes=int(os.environ.get("GKEY_CACHE_MAX_DISK_BYTES", str(256 * 1024 * 1024))),
+        )
+    inflight_tasks: dict[str, "asyncio.Task[str]"] = {}
+    load = {"inflight": 0, "queue_max": 0, "retried": 0}
     fake = FakeBackend(delay_ms=fake_delay_ms, pool_size=pool_size) if fake_backend else None
     sdk_backend = SDKBackend(default_model=default_model, concurrency=pool_size)
     agy_backend = AgyCLIBackend(
@@ -637,6 +834,11 @@ def create_app(
                 "warm_workers": agy_backend.pool.qsize() if name == "agy" else 0,
                 "fake_backend": fake is not None,
                 "last_warm_error": agy_backend.last_warm_error,
+                "retries": retries,
+                "retried_requests": load["retried"],
+                "inflight": load["inflight"],
+                "queue_max": load["queue_max"],
+                **(cache.stats() if cache is not None else {"cache_enabled": False}),
             }
         )
 
@@ -684,12 +886,36 @@ def create_app(
         t_start = time.perf_counter()
         prompt_chars = sum(len(str(m.get("content", ""))) for m in messages)
 
+        load["inflight"] += 1
+        queued = max(0, load["inflight"] - pool_size)
+        load["queue_max"] = max(load["queue_max"], queued)
+        if queued:
+            logger.info("QUEUE depth=%d inflight=%d pool=%d", queued, load["inflight"], pool_size)
+        released = [False]
+
+        def release() -> None:
+            if not released[0]:
+                released[0] = True
+                load["inflight"] -= 1
+
+        cache_state = ["-"]
+
         def log_req(status: str, ttft: Optional[float], out_chars: int) -> None:
             # One machine-parsable line per request: `gkey --logs` / bench scripts read these.
             logger.info(
-                "REQ id=%s engine=%s stream=%d status=%s in_chars=%d out_chars=%d ttft_ms=%s total_ms=%.0f",
+                "REQ id=%s engine=%s stream=%d status=%s in_chars=%d out_chars=%d ttft_ms=%s total_ms=%.0f queued=%d cache=%s",
                 completion_id[-8:], engine_name, int(stream), status, prompt_chars, out_chars,
                 "-" if ttft is None else f"{ttft * 1000:.0f}", (time.perf_counter() - t_start) * 1000,
+                queued, cache_state[0],
+            )
+
+        def backend_stream() -> AsyncIterator[str]:
+            def note_retry() -> None:
+                load["retried"] += 1
+
+            return retrying_stream(
+                backend, retries, on_retry=note_retry,
+                messages=messages, model=req_model, response_format=response_format,
             )
 
         if stream:
@@ -712,11 +938,7 @@ def create_app(
                 ttft: Optional[float] = None
                 n_out = 0
                 try:
-                    async for delta in backend.stream_chat(
-                        messages=messages,
-                        model=req_model,
-                        response_format=response_format,
-                    ):
+                    async for delta in backend_stream():
                         if ttft is None:
                             ttft = time.perf_counter() - t_start
                         n_out += len(delta)
@@ -743,9 +965,12 @@ def create_app(
                             "type": "server_error",
                         }
                     }
+                    release()
                     yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
                     yield b"data: [DONE]\n\n"
                     return
+                finally:
+                    release()
 
                 stop_chunk = {
                     "id": completion_id,
@@ -775,19 +1000,52 @@ def create_app(
             )
 
         # Non-streaming response
-        try:
+        ttft_box: list[Optional[float]] = [None]
+
+        async def generate_text() -> str:
             chunks: list[str] = []
-            ttft_ns: Optional[float] = None
-            async for delta in backend.stream_chat(
-                messages=messages,
-                model=req_model,
-                response_format=response_format,
-            ):
-                if ttft_ns is None:
-                    ttft_ns = time.perf_counter() - t_start
+            async for delta in backend_stream():
+                if ttft_box[0] is None:
+                    ttft_box[0] = time.perf_counter() - t_start
                 chunks.append(delta)
-            full_text = "".join(chunks).strip()
-            log_req("ok", ttft_ns, len(full_text))
+            return "".join(chunks).strip()
+
+        try:
+            if cache is None:
+                full_text = await generate_text()
+            else:
+                key = cache_key(body, f"{engine_name}|{default_model}|{effort}")
+                hit = cache.get(key)
+                if hit is not None:
+                    cache.hits += 1
+                    cache_state[0] = "hit"
+                    full_text = hit
+                else:
+                    task = inflight_tasks.get(key)
+                    if task is not None:
+                        cache.coalesced += 1
+                        cache_state[0] = "coalesced"
+                    else:
+                        cache.misses += 1
+                        cache_state[0] = "miss"
+
+                        async def compute() -> str:
+                            text = await generate_text()
+                            cache.put(key, text)  # only reached on success: errors are never cached
+                            return text
+
+                        task = asyncio.create_task(compute())
+                        inflight_tasks[key] = task
+
+                        def _done(t: "asyncio.Task[str]", key: str = key) -> None:
+                            if inflight_tasks.get(key) is t:
+                                del inflight_tasks[key]
+                            if not t.cancelled():
+                                t.exception()  # mark retrieved even if every waiter went away
+
+                        task.add_done_callback(_done)
+                    full_text = await asyncio.shield(task)
+            log_req("ok", ttft_box[0], len(full_text))
         except Exception as e:
             logger.exception("Error during chat completion (%s)", engine_name)
             log_req("error", None, 0)
@@ -801,6 +1059,8 @@ def create_app(
                 },
                 status_code=500,
             )
+        finally:
+            release()
 
         return JSONResponse(
             {
@@ -922,6 +1182,24 @@ def main() -> None:
         default=float(os.environ.get("GKEY_FAKE_DELAY_MS", "20")),
         help="Simulated per-request model delay in fake-backend mode (default 20)",
     )
+    parser.add_argument(
+        "--cache",
+        action="store_true",
+        default=os.environ.get("GKEY_CACHE", "") not in ("", "0", "false"),
+        help="Opt-in response cache (+ coalescing of identical in-flight requests) for non-streaming calls",
+    )
+    parser.add_argument(
+        "--cache-disk",
+        action="store_true",
+        default=os.environ.get("GKEY_CACHE_DISK", "") not in ("", "0", "false"),
+        help="With --cache: also persist responses under GKEY_HOME/cache (size bounded)",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=int(os.environ.get("GKEY_RETRIES", "0")),
+        help="Retries (exponential backoff + jitter) on transient backend failures (default 0)",
+    )
     args = parser.parse_args()
     args.pool_size = max(1, min(args.pool_size, MAX_POOL_SIZE))
     if args.host not in ("127.0.0.1", "localhost", "::1"):
@@ -939,6 +1217,9 @@ def main() -> None:
         max_turns_per_worker=args.max_turns,
         fake_backend=args.fake_backend,
         fake_delay_ms=args.fake_delay_ms,
+        cache_enabled=args.cache,
+        cache_disk=args.cache_disk,
+        retries=args.retries,
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 

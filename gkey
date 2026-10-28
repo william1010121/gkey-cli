@@ -38,6 +38,11 @@ BACKEND="${GKEY_BACKEND:-auto}"
 EFFORT="${GKEY_EFFORT:-low}"
 DEFAULT_POOL="${GKEY_POOL_SIZE:-4}"
 EXPLICIT_POOL=""
+OPT_FAST=""; OPT_BATCH=""; OPT_PARFILES=""
+CACHE="${GKEY_CACHE:-}"; CACHE_DISK="${GKEY_CACHE_DISK:-}"
+[[ "${CACHE}" == "0" || "${CACHE}" == "false" ]] && CACHE=""
+[[ "${CACHE_DISK}" == "0" || "${CACHE_DISK}" == "false" ]] && CACHE_DISK=""
+RETRIES="${GKEY_RETRIES:-}"; OPT_RETRIES=""
 POOL_SIZE="${DEFAULT_POOL}"
 
 # Make the venv's tools (e.g. uv) and common user bin dirs visible.
@@ -63,6 +68,8 @@ Examples:
                                         also writes <name>-zh-TW-then-en.pdf (Chinese pages, then originals)
   gkey pdf2zh paper.pdf --layout dual   pdf2zh's own outputs only (no merged PDF); -lo ja for another language
   gkey pdf2zh paper.pdf -t 8            8 threads; gkey grows its worker pool to match
+  gkey --fast pdf2zh paper.pdf          Tuned profile (-t 16, 16 workers)
+  gkey --parallel-files 3 pdf2zh a.pdf b.pdf c.pdf   Three papers at once, prefixed logs
   gkey markitdown input.pdf -o out.md   Any document to Markdown
   gkey gpt-subtrans movie.srt -o zh.srt Translate subtitles
   git diff | gkey mods "review this"    LLM in a UNIX pipe
@@ -78,10 +85,26 @@ Options (before <tool>):
       --pool-size <n>       Proxy worker pool size, 1-16 (default: ${DEFAULT_POOL}; auto-grows
                             when the tool's own thread flag, e.g. pdf2zh -t 8, asks for more)
 
+Speed options (all opt-in; unverified against real models, see README "Going faster"):
+      --fast                Apply the tool's tuned profile (e.g. pdf2zh gets -t 16 and a 16-worker pool).
+                            Flags you pass yourself always win; tools without a profile run unchanged.
+      --batch <n>           Pass a batch size to tools that have a batch option (ignored with a message otherwise)
+      --parallel-files <n>  Several input files, one run each, up to n at once through the same proxy
+                            (pool auto-grows; per-file output, exit code and log prefix are kept)
+      --cache               Proxy caches identical non-streaming prompts (memory; hit rate in --status/--logs)
+      --cache-disk          Like --cache, also persists answers under GKEY_HOME/cache (size bounded)
+      --retries <n>         Proxy retries transient backend failures n times (exponential backoff + jitter)
+
 Benchmark (no real model calls unless --bench-real):
   --bench                   Measure proxy overhead against a fake backend (p50/p95/max, req/s)
       --concurrency <n>     Parallel clients (default: 4)
       --requests <m>        Total requests (default: 40)
+      --dup-pct <p>         Percent of requests that repeat an earlier prompt (default: 0; shows --cache)
+      --delay-ms <ms>       Simulated model time per request (default: 20)
+      --compare <spec>      Repeatable. Compare configs side by side, e.g.
+                            --bench --compare pool=4 --compare pool=16
+                            --bench --dup-pct 50 --compare cache=off --compare cache=on
+                            (keys: pool, cache, dup, conc, reqs, delay; --pool-size/--cache set the baseline)
   --bench-real              Send ONE tiny prompt per backend (agy, sdk) and print time-to-first-token
 
 Management:
@@ -144,6 +167,15 @@ daemon_needs_restart() {
   [[ -n "${OPT_MODEL}" && "$(health_field "${h}" default_model)" != "${MODEL}" ]] && return 0
   [[ -n "${OPT_BACKEND}" && "$(health_field "${h}" backend_mode)" != "${BACKEND}" ]] && return 0
   [[ -n "${OPT_EFFORT}" && "$(health_field "${h}" effort)" != "${EFFORT}" ]] && return 0
+  local running_cache
+  running_cache="$(health_field "${h}" cache_enabled)"
+  if [[ -n "${CACHE}" ]]; then
+    [[ "${running_cache}" != "true" ]] && return 0
+    [[ -n "${CACHE_DISK}" && "$(health_field "${h}" cache_disk)" != "true" ]] && return 0
+  else
+    [[ "${running_cache}" == "true" ]] && return 0
+  fi
+  [[ -n "${OPT_RETRIES}" && "$(health_field "${h}" retries)" != "${RETRIES}" ]] && return 0
   running_pool="$(health_field "${h}" pool_size)"
   running_pool="${running_pool:-0}"
   if [[ -n "${EXPLICIT_POOL}" ]]; then
@@ -166,6 +198,8 @@ start_daemon() {
     --model "${MODEL}" \
     --effort "${EFFORT}" \
     --pool-size "${POOL_SIZE}" \
+    ${CACHE:+--cache} ${CACHE_DISK:+--cache-disk} \
+    --retries "${RETRIES:-0}" \
     >"${LOG_FILE}" 2>&1 &
 
   local pid=$!
@@ -221,7 +255,8 @@ compute_pool() {
 ACTION=""
 INSTALL_TARGET=""
 OPT_MODEL=""; OPT_BACKEND=""; OPT_EFFORT=""
-BENCH_CONC=4; BENCH_REQS=40
+BENCH_CONC=4; BENCH_REQS=40; BENCH_DUP=0; BENCH_DELAY=20
+BENCH_COMPARE=()
 
 need_value() {
   if [[ $# -lt 2 || -z "${2:-}" ]]; then
@@ -237,6 +272,15 @@ while [[ $# -gt 0 ]]; do
     -e|--effort) need_value "$@"; EFFORT="$2"; OPT_EFFORT=1; shift 2 ;;
     -p|--port) need_value "$@"; PORT="$2"; set_paths; shift 2 ;;
     --pool-size) need_value "$@"; EXPLICIT_POOL="$2"; shift 2 ;;
+    --fast) OPT_FAST=1; shift ;;
+    --batch) need_value "$@"; OPT_BATCH="$2"; shift 2 ;;
+    --parallel-files) need_value "$@"; OPT_PARFILES="$2"; shift 2 ;;
+    --cache) CACHE=1; shift ;;
+    --cache-disk) CACHE=1; CACHE_DISK=1; shift ;;
+    --retries) need_value "$@"; RETRIES="$2"; OPT_RETRIES=1; shift 2 ;;
+    --dup-pct) need_value "$@"; BENCH_DUP="$2"; shift 2 ;;
+    --delay-ms) need_value "$@"; BENCH_DELAY="$2"; shift 2 ;;
+    --compare) need_value "$@"; BENCH_COMPARE+=("$2"); shift 2 ;;
     --concurrency) need_value "$@"; BENCH_CONC="$2"; shift 2 ;;
     --requests) need_value "$@"; BENCH_REQS="$2"; shift 2 ;;
     --bench) ACTION="bench"; shift ;;
@@ -261,6 +305,16 @@ if [[ -n "${EXPLICIT_POOL}" ]] && ! [[ "${EXPLICIT_POOL}" =~ ^[0-9]+$ ]]; then
   echo "[gkey] Error: --pool-size must be a positive integer" >&2; exit 1
 fi
 if ! [[ "${DEFAULT_POOL}" =~ ^[0-9]+$ ]]; then DEFAULT_POOL=4; fi
+for _v in "${OPT_BATCH}" "${OPT_PARFILES}"; do
+  if [[ -n "${_v}" ]] && ! [[ "${_v}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[gkey] Error: --batch and --parallel-files need a positive integer" >&2; exit 1
+  fi
+done
+if [[ -n "${RETRIES}" ]] && ! [[ "${RETRIES}" =~ ^[0-9]+$ ]]; then
+  echo "[gkey] Error: --retries must be a non-negative integer" >&2; exit 1
+fi
+# Hand the speed choices to catalog.py (adapt / poolsize).
+export GKEY_FAST="${OPT_FAST}" GKEY_BATCH="${OPT_BATCH}" GKEY_PARALLEL_FILES="${OPT_PARFILES}"
 
 # `gkey info <tool>` / `gkey help [tool]`
 if [[ -z "${ACTION}" && $# -gt 0 ]]; then
@@ -283,7 +337,9 @@ case "${ACTION}" in
     done
     exec "${PYTHON_BIN}" "${GKEY_DIR}/bench.py" "--${ACTION#bench-}" \
       --concurrency "${BENCH_CONC}" --requests "${BENCH_REQS}" \
-      --pool-size "${EXPLICIT_POOL:-${DEFAULT_POOL}}" --model "${MODEL}" --effort "${EFFORT}" ;;
+      --pool-size "${EXPLICIT_POOL:-${DEFAULT_POOL}}" --model "${MODEL}" --effort "${EFFORT}" \
+      --dup-pct "${BENCH_DUP}" --delay-ms "${BENCH_DELAY}" ${CACHE:+--cache} \
+      ${BENCH_COMPARE[@]+"${BENCH_COMPARE[@]/#/--compare=}"} ;;
   list)
     "${PYTHON_BIN}" "${CATALOG_SCRIPT}" list
     exit 0 ;;
@@ -293,7 +349,11 @@ case "${ACTION}" in
   status)
     if is_running; then
       echo "[gkey] Proxy is RUNNING at http://${HOST}:${PORT}/v1"
-      health_json; echo ""
+      h="$(health_json)"; printf '%s\n' "${h}"
+      if [[ "$(health_field "${h}" cache_enabled)" == "true" ]]; then
+        echo "[gkey] Cache: hit rate $(health_field "${h}" cache_hit_rate) (hits $(health_field "${h}" cache_hits), coalesced $(health_field "${h}" cache_coalesced), misses $(health_field "${h}" cache_misses), entries $(health_field "${h}" cache_entries))"
+      fi
+      echo "[gkey] Load: in flight $(health_field "${h}" inflight), max queue depth $(health_field "${h}" queue_max), retried requests $(health_field "${h}" retried_requests) (retries=$(health_field "${h}" retries))"
     else
       echo "[gkey] Proxy is STOPPED (port ${PORT})"
     fi
