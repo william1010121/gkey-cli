@@ -396,6 +396,9 @@ if [[ $# -eq 0 ]]; then
   exec "${PYTHON_BIN}" "${MENU_SCRIPT}"
 fi
 
-ensure_daemon
+# Tools that never call a model (e.g. markitdown) do not need the proxy: skip starting it.
+if "${PYTHON_BIN}" "${CATALOG_SCRIPT}" needs-proxy "$1"; then
+  ensure_daemon
+fi
 
 exec "${PYTHON_BIN}" "${CATALOG_SCRIPT}" adapt "${PORT}" "${MODEL}" "$@"

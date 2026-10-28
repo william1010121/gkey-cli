@@ -77,13 +77,13 @@ gkey still rewrites numbers with exponents (the old pdf2zh `unknown keyword: '1.
 | --- | --- | --- |
 | `pdf2zh-next` (alias `pdf2zh`) | Traditional Chinese (zh-TW) paper PDFs; keeps math and layout; Chinese pages then originals | `gkey pdf2zh-next paper.pdf` |
 | `babeldoc` | Next-gen PDF layout translation (`--qps`/`-q`, `--pool-max-workers` grow the pool; `--no-auto-extract-glossary` skips an extra LLM pass) | `gkey babeldoc paper.pdf` |
-| `markitdown` | PDF/PPTX/DOCX/XLSX to Markdown (local converter: the CLI makes no model calls, nothing to tune) | `gkey markitdown in.pdf -o out.md` |
+| `markitdown` | PDF/PPTX/DOCX/XLSX to Markdown (local converter: the CLI makes no model calls, so gkey does not start the proxy for it) | `gkey markitdown in.pdf -o out.md` |
 | `marker_single` | High-accuracy PDF to Markdown (tables, math); `--max_concurrency`, `--timeout` (needs image input and JSON-schema `response_format` from the backend) | `gkey marker_single paper.pdf` |
-| `gpt-subtrans` | Subtitle (.srt/.ass) translation; sequential, tune `--maxbatchsize` / `--scenethreshold` | `gkey gpt-subtrans a.srt -o b.srt` |
+| `gpt-subtrans` | Subtitle (.srt/.ass) translation; source-installed under `~/.gkey/tools`, run with `-m gpt-4o-mini` (chat completions); sequential, tune `--maxbatchsize` / `--scenethreshold` | `gkey gpt-subtrans a.srt -o b.srt` |
 | `bbook_maker` | Bilingual EPUB (PyPI `bbook_maker`); `--parallel-workers N` for chapter parallelism | `gkey bbook_maker book.epub --test` |
 | `epub_to_audiobook` | EPUB to audiobook (macOS TTS); `--worker_count N`, `--no_prompt` for unattended runs | `gkey epub_to_audiobook book.epub out/` |
 | `videocaptioner` | Re-segment and translate Whisper subtitles (runs the real CLI; `subtitle`/`process` accept `--thread-num`, `--batch-size`) | `gkey videocaptioner subtitle in.srt --translator llm --target-language zh-Hant` |
-| `fabric` | Prompt patterns for pipes (uses fabric's LiteLLM vendor: Chat Completions, not `/v1/responses`) | `cat a.md \| gkey fabric -p summarize` |
+| `fabric` | Prompt patterns for pipes (uses fabric's LiteLLM vendor: Chat Completions, not `/v1/responses`; downloads patterns once with `fabric -U`) | `cat a.md \| gkey fabric -p summarize` |
 | `mods` | LLM in UNIX pipes (settings via `XDG_CONFIG_HOME`; `--no-cache --max-retries 2` in fast mode) | `git diff \| gkey mods "review"` |
 | `ai-renamer` | Rename files by content (base URL without `/v1`; private HOME keeps your `~/ai-renamer.json`; `--frames 2` in fast mode) | `gkey ai-renamer ~/Desktop/shots` |
 | `oco` | Commit messages from staged diff (`OCO_TOKENS_MAX_INPUT=32768` in fast mode) | `gkey oco` |

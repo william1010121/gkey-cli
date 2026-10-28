@@ -75,6 +75,11 @@ class ToolSpec:
     fast: Optional[dict] = None
     batch_flag: Optional[str] = None
     per_file: Optional[dict] = None
+    # True for tools that never call a model: gkey skips starting the proxy for them.
+    no_model: bool = False
+    # Source-only tools (no console script): {"repo", "dir", "script", "pip": [...]}. gkey clones the repo and
+    # builds a venv under GKEY_HOME/tools/<dir>, then runs `<venv python> <script>` from the checkout.
+    source_install: Optional[dict] = None
 
 
 # `uv tool install` refuses to replace the `pdf2zh` executable of the old PDFMathTranslate, which pdf2zh-next also ships,
@@ -161,8 +166,10 @@ TOOLS: list[ToolSpec] = [
         auto_adapt_note=(
             "Nothing to adapt or tune: the markitdown CLI makes no LLM calls (llm_client is only available through its Python API), "
             "reads no OPENAI_* variables and has no thread/batch flags, so gkey just runs it. Speed is local CPU/IO; "
-            "for many files run several processes yourself (one input per process), e.g. with `xargs -P`."
+            "for many files run several processes yourself (one input per process), e.g. with `xargs -P`. "
+            "Because it never calls a model, gkey does not start the proxy for it."
         ),
+        no_model=True,
     ),
     ToolSpec(
         id="marker_single",
@@ -197,7 +204,17 @@ TOOLS: list[ToolSpec] = [
         repo="https://github.com/machinewrapped/llm-subtrans",
         summary="Context-aware .srt / .ass subtitle translation that keeps timing intact",
         why_useful="Translates existing subtitle files with a sliding context window, giving fluent output while keeping timestamps aligned.",
-        install_cmd='uv tool install --with openai "git+https://github.com/machinewrapped/llm-subtrans.git"',
+        install_cmd=(
+            "git clone --depth 1 https://github.com/machinewrapped/llm-subtrans.git $GKEY_HOME/tools/llm-subtrans/repo && "
+            "uv venv $GKEY_HOME/tools/llm-subtrans/venv && "
+            "uv pip install --python $GKEY_HOME/tools/llm-subtrans/venv/bin/python -e $GKEY_HOME/tools/llm-subtrans/repo openai"
+        ),
+        source_install={
+            "repo": "https://github.com/machinewrapped/llm-subtrans.git",
+            "dir": "llm-subtrans",
+            "script": "scripts/gpt-subtrans.py",
+            "pip": ["openai"],
+        },
         usage_examples=[
             "gkey gpt-subtrans movie.srt -o movie.zh.srt",
             "gkey gpt-subtrans movie.srt -l 'Japanese' -o movie.ja.srt",
@@ -205,8 +222,12 @@ TOOLS: list[ToolSpec] = [
         ],
         default_prompt_hint="Append a subtitle path, e.g. input.srt -o output.srt",
         auto_adapt_note=(
+            "llm-subtrans 1.7+ ships no console script, so gkey clones it into `$GKEY_HOME/tools/llm-subtrans` (venv included) and runs "
+            "`python scripts/gpt-subtrans.py` from that checkout (it needs the checkout's `instructions/`); input/output paths are made absolute first. "
             "Passes `-b <gkey proxy>` (gpt-subtrans always sends its own --apibase default of api.openai.com, which would otherwise beat the "
-            "environment), `-k`, `-m <gkey model>` and `-l <GKEY_TARGET_LANG>` (default: Traditional Chinese) unless you give them. "
+            "environment), `-k`, `-m gpt-4o-mini` (a non-reasoning name, so it uses /v1/chat/completions; the proxy maps it to your gkey model; "
+            "other names are treated as reasoning models and call /v1/responses, which gkey does not serve) and "
+            "`-l <GKEY_TARGET_LANG>` (default: Traditional Chinese) unless you give them. "
             "The CLI translates batches sequentially (its MAX_THREADS only applies to the GUI), so the only speed levers are larger/fewer "
             "batches: `--maxbatchsize` (default 100) and `--scenethreshold` (default 60s; batches never cross scenes). "
             "Run several files in parallel as separate processes."
@@ -408,7 +429,7 @@ TOOLS: list[ToolSpec] = [
 # batch_flag="--flag", per_file={"value_flags": [...]}. See gkey_speed.py.
 SPEED: dict = {
     "pdf2zh-next": {
-        # gkey already injects --qps/--pool-max-workers 16 when neither is given (adapt_args runs first), so this
+        # gkey already injects --qps/--pool-max-workers 16 when neither is given (speed options run first, then adapt_args), so this
         # profile mostly just sizes the pool; a user-given --qps/--pool-max-workers wins over both (see CONCURRENCY_FLAGS).
         "fast": {"flags": ["--qps", "16", "--pool-max-workers", "16"], "pool": 16},
     },
@@ -424,8 +445,47 @@ for _old, _new in LEGACY_ALIASES.items():
     TOOL_BY_ID[_old] = TOOL_BY_ID[_new]
 
 
+_SUBTRANS_MODEL = "gpt-4o-mini"  # not a reasoning model for llm-subtrans (chat completions); the proxy maps it to the gkey model
+
+
+def source_paths(spec: ToolSpec) -> Optional[dict]:
+    """Checkout/venv/script paths of a source-installed tool, or None for normal tools."""
+    si = spec.source_install
+    if not si:
+        return None
+    root = gkey_home() / "tools" / si["dir"]
+    return {"root": root, "repo": root / "repo", "python": root / "venv" / "bin" / "python",
+            "script": root / "repo" / si["script"]}
+
+
+def _install_source_tool(spec: ToolSpec) -> bool:
+    paths = source_paths(spec)
+    si = spec.source_install
+    steps = []
+    if not paths["repo"].is_dir():
+        steps.append(["git", "clone", "--depth", "1", si["repo"], str(paths["repo"])])
+    if not paths["python"].exists():
+        steps.append(["uv", "venv", str(paths["root"] / "venv")])
+    steps.append(["uv", "pip", "install", "--python", str(paths["python"]), "-e", str(paths["repo"]), *si.get("pip", [])])
+    paths["root"].mkdir(parents=True, exist_ok=True)
+    for cmd in steps:
+        sys.stderr.write(f"[gkey] running: {' '.join(cmd)}\n")
+        try:
+            rc = subprocess.run(cmd).returncode
+        except FileNotFoundError:
+            sys.stderr.write(f"[gkey] `{cmd[0]}` not found; install it first.\n")
+            return False
+        if rc != 0:
+            sys.stderr.write(f"\n[gkey] Failed to install {spec.name} (step `{' '.join(cmd[:2])}` exit code {rc}).\n")
+            return False
+    return True
+
+
 def is_tool_installed(spec: ToolSpec) -> Optional[str]:
     ensure_extended_path()
+    paths = source_paths(spec)
+    if paths:
+        return str(paths["script"]) if paths["python"].exists() and paths["script"].is_file() else None
     path = shutil.which(spec.binary)
     if path:
         return path
@@ -443,6 +503,11 @@ def install_tool(spec: ToolSpec) -> bool:
 
     err = sys.stderr
     err.write(f"\n[gkey] {spec.name} ({spec.binary}) is not installed; installing it now...\n")
+    if spec.source_install:
+        if not _install_source_tool(spec):
+            return False
+        err.write(f"\n[gkey] {spec.name} installed.\n\n")
+        return True
     err.write(f"[gkey] running: {spec.install_cmd}\n\n")
     err.flush()
 
@@ -489,6 +554,33 @@ def _ensure_fabric_config(base_url: str, api_key: str, model: str) -> None:
         f"LITELLM_API_KEY={api_key}\n"
         f"LITELLM_API_BASE_URL={base_url}\n",
     )
+
+
+def _fabric_patterns_dir() -> pathlib.Path:
+    return pathlib.Path.home() / ".config" / "fabric" / "patterns"
+
+
+def _ensure_fabric_patterns(args: List[str], env: dict) -> None:
+    """Download fabric's patterns once (`fabric -U`): a fresh install has none and `-p <name>` fails.
+
+    Skipped when the patterns dir already has content, or the user is running -U/-S/-h themselves.
+    A failed download only warns (offline use of already-present patterns keeps working).
+    """
+    if any(a in ("-U", "--updatepatterns", "-S", "--setup", "-h", "--help") for a in args):
+        return
+    pdir = _fabric_patterns_dir()
+    if pdir.is_dir() and any(pdir.iterdir()):
+        return
+    sys.stderr.write("[gkey] fabric has no patterns yet; downloading them once (fabric -U)...\n")
+    try:
+        # fabric prints progress on stdout: keep it off the pipe the user may be reading, and never let it eat piped input
+        rc = subprocess.run(["fabric", "-U"], env={**os.environ, **env}, stdout=sys.stderr,
+                            stdin=subprocess.DEVNULL).returncode
+    except OSError as exc:
+        sys.stderr.write(f"[gkey] could not run `fabric -U`: {exc}\n")
+        return
+    if rc != 0:
+        sys.stderr.write(f"[gkey] `fabric -U` failed (exit {rc}); run it manually if patterns are missing.\n")
 
 
 def _ensure_mods_config(base_url: str, model: str) -> pathlib.Path:
@@ -556,12 +648,13 @@ def _find_lobe_config(start: pathlib.Path):
     return None
 
 
-def _lobe_int(name: str) -> Optional[int]:
-    v = os.environ.get(name, "")
+def _lobe_int(name: str, env: Optional[dict] = None) -> Optional[int]:
+    """GKEY_LOBE_* value from `env` (the child env being built, e.g. the --fast profile) or os.environ."""
+    v = (env or {}).get(name) or os.environ.get(name, "")
     return int(v) if v.isdigit() and int(v) > 0 else None
 
 
-def _ensure_lobe_config(cwd: Optional[pathlib.Path] = None) -> Optional[pathlib.Path]:
+def _ensure_lobe_config(cwd: Optional[pathlib.Path] = None, env: Optional[dict] = None) -> Optional[pathlib.Path]:
     """Write a merged copy of the project's JSON config with a supported modelName (and optional
     concurrency / splitToken); return its path, or None when no JSON config was found."""
     import json
@@ -572,7 +665,9 @@ def _ensure_lobe_config(cwd: Optional[pathlib.Path] = None) -> Optional[pathlib.
     src, cfg, _is_pkg = found
     cfg = dict(cfg)
     cfg["modelName"] = _LOBE_MODEL
-    conc, split = _lobe_int("GKEY_LOBE_CONCURRENCY"), _lobe_int("GKEY_LOBE_SPLIT_TOKEN")
+    # Without this lobe-i18n only writes the output file at the very end and leaves `{}` if anything goes wrong.
+    cfg["saveImmediately"] = True
+    conc, split = _lobe_int("GKEY_LOBE_CONCURRENCY", env), _lobe_int("GKEY_LOBE_SPLIT_TOKEN", env)
     if conc:
         cfg["concurrency"] = conc
     if split:
@@ -807,7 +902,7 @@ def adapt_args(spec: ToolSpec, args: List[str], port: str, model: str, env: dict
         if not _has_flag(args, "-k", "--apikey"):
             args.extend(["-k", api_key])
         if not _has_flag(args, "-m", "--model"):
-            args.extend(["-m", model])
+            args.extend(["-m", _SUBTRANS_MODEL])
         if not _has_flag(args, "-l", "--target-language"):
             args.extend(["-l", lang])
 
@@ -834,6 +929,7 @@ def adapt_args(spec: ToolSpec, args: List[str], port: str, model: str, env: dict
         env["DEFAULT_MODEL"] = model
         env["LITELLM_API_KEY"] = api_key
         env["LITELLM_API_BASE_URL"] = base_url
+        _ensure_fabric_patterns(args, env)
 
     elif spec.id == "mods":
         env["XDG_CONFIG_HOME"] = str(_ensure_mods_config(base_url, model))
@@ -875,7 +971,7 @@ def adapt_args(spec: ToolSpec, args: List[str], port: str, model: str, env: dict
         env["OPENAI_PROXY_URL"] = base_url
         env["OPENAI_API_KEY"] = api_key
         if not any(a in ("-c", "--config") or a.startswith("--config=") for a in args):
-            merged = _ensure_lobe_config()
+            merged = _ensure_lobe_config(env=env)
             if merged:
                 args = ["-c", str(merged)] + args
             else:
@@ -885,6 +981,30 @@ def adapt_args(spec: ToolSpec, args: List[str], port: str, model: str, env: dict
                 )
 
     return args
+
+
+# Options of source-run tools whose value is an output path (made absolute before the cwd changes).
+_SOURCE_PATH_VALUE_FLAGS = ("-o", "--output", "--instructionfile", "--glossaryfile")
+
+
+def source_launch(spec: ToolSpec, args: List[str]) -> "tuple[List[str], pathlib.Path]":
+    """argv + cwd to run a source-installed tool: its script, from the checkout (it reads `instructions/`
+    relative to the cwd). Relative file arguments are made absolute first so they still resolve."""
+    paths = source_paths(spec)
+    out: List[str] = []
+    take_value = False
+    for a in args:
+        if take_value:
+            a, take_value = os.path.abspath(a), False
+        elif a in _SOURCE_PATH_VALUE_FLAGS:
+            take_value = True
+        elif a.startswith("-") and "=" in a and a.split("=", 1)[0] in _SOURCE_PATH_VALUE_FLAGS:
+            k, v = a.split("=", 1)
+            a = f"{k}={os.path.abspath(v)}"
+        elif not a.startswith("-") and os.path.exists(a):
+            a = os.path.abspath(a)
+        out.append(a)
+    return [str(paths["python"]), str(paths["script"])] + out, paths["repo"]
 
 
 def is_help_run(args: List[str]) -> bool:
@@ -956,8 +1076,9 @@ def adapt_and_exec(port: str, model: str, argv: List[str]) -> None:
         # Help/version flags pass through untouched
         is_help = any(a in ("-h", "--help", "-v", "--version") for a in args)
         if not is_help:
-            args = adapt_args(spec, args, port, model, env_updates)
+            # Speed first: its env (e.g. --fast's GKEY_LOBE_*) is read by adapt_args through `env_updates`.
             args = apply_speed_options(spec, args, env_updates)
+            args = adapt_args(spec, args, port, model, env_updates)
 
     layout = env_updates.pop("GKEY_PDF2ZH_LAYOUT", None)
     os.environ.update(env_updates)
@@ -967,6 +1088,11 @@ def adapt_and_exec(port: str, model: str, argv: List[str]) -> None:
             sys.exit(rc)
     if spec is not None and spec.id == "pdf2zh-next" and layout:
         sys.exit(run_pdf2zh(cmd_name, args, layout))
+    if spec is not None and spec.source_install:
+        argv_exec, cwd = source_launch(spec, args)
+        os.environ["PYTHONPATH"] = os.pathsep.join(p for p in (str(cwd), os.environ.get("PYTHONPATH", "")) if p)
+        os.chdir(cwd)
+        os.execv(argv_exec[0], argv_exec)
     try:
         os.execvp(cmd_name, [cmd_name] + args)
     except FileNotFoundError:
@@ -1061,6 +1187,10 @@ def main() -> None:
         detected = detect_concurrency(spec.id, sys.argv[5:]) if spec else None
         hint = gkey_speed.speed_pool_hint(spec, sys.argv[5:], SPEED) if spec else None
         print(compute_pool_size(default, explicit, max(detected or 0, hint or 0) or None))
+    elif action == "needs-proxy":
+        # exit 1 when the tool never calls a model (gkey then skips starting the proxy)
+        spec = TOOL_BY_ID.get(sys.argv[2].strip()) if len(sys.argv) > 2 else None
+        sys.exit(1 if spec is not None and spec.no_model else 0)
     elif action == "adapt":
         adapt_and_exec(sys.argv[2], sys.argv[3], sys.argv[4:])
     else:

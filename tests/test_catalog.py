@@ -158,7 +158,7 @@ def test_videocaptioner_install_installs_the_cli():
 def test_gpt_subtrans_points_at_proxy_and_respects_user_flags():
     args, _ = adapt("gpt-subtrans", ["a.srt", "-o", "b.srt"])
     assert args[args.index("-b") + 1] == f"http://127.0.0.1:{PORT}/v1"
-    assert args[args.index("-m") + 1] == MODEL
+    assert args[args.index("-m") + 1] == "gpt-4o-mini"  # chat-completions model name, not the gkey model
     assert args[args.index("-l") + 1] == "Traditional Chinese"
     args, _ = adapt("gpt-subtrans", ["a.srt", "--target-language", "Japanese", "--apibase=http://x/v1", "-m", "m"])
     assert "-l" not in args and "-b" not in args and args.count("-m") == 1
@@ -243,6 +243,7 @@ def _home(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setenv("GKEY_HOME", str(tmp_path / "gk"))
     (tmp_path / "home").mkdir(exist_ok=True)
+    monkeypatch.setattr(catalog, "_ensure_fabric_patterns", lambda *a, **k: None)  # never run a real `fabric -U`
 
 
 def test_fabric_uses_litellm_vendor_not_responses_api(monkeypatch, tmp_path):
@@ -370,3 +371,168 @@ def test_gkey_help_has_no_shell_expansion_in_heredoc():
     end = text.index("\nEOF", start)
     body = text[start:end]
     assert "`" not in body and "$(" not in body
+
+
+# ---- tool-bug fixes found by the benchmark -------------------------------------------------------
+
+def test_gpt_subtrans_uses_chat_completions_model_name():
+    args, _ = adapt("gpt-subtrans", ["a.srt"])
+    model = args[args.index("-m") + 1]
+    assert model == "gpt-4o-mini" and model != MODEL
+    # llm-subtrans treats everything not starting with gpt-3 / gpt-4 / gpt-5-chat as a /v1/responses model
+    assert model.startswith("gpt-4")
+
+
+def test_gpt_subtrans_is_a_source_install(monkeypatch, tmp_path):
+    monkeypatch.setenv("GKEY_HOME", str(tmp_path))
+    spec = catalog.TOOL_BY_ID["gpt-subtrans"]
+    assert spec.source_install and "console" not in spec.install_cmd
+    assert catalog.is_tool_installed(spec) is None
+    paths = catalog.source_paths(spec)
+    paths["python"].parent.mkdir(parents=True)
+    paths["python"].write_text("")
+    paths["script"].parent.mkdir(parents=True)
+    paths["script"].write_text("")
+    assert catalog.is_tool_installed(spec) == str(paths["script"])
+
+
+def test_install_source_tool_runs_clone_venv_pip(monkeypatch, tmp_path):
+    monkeypatch.setenv("GKEY_HOME", str(tmp_path))
+    spec = catalog.TOOL_BY_ID["gpt-subtrans"]
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        paths = catalog.source_paths(spec)
+        if cmd[0] == "git":
+            paths["script"].parent.mkdir(parents=True)
+            paths["script"].write_text("")
+        if cmd[:2] == ["uv", "venv"]:
+            paths["python"].parent.mkdir(parents=True)
+            paths["python"].write_text("")
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(catalog.subprocess, "run", fake_run)
+    assert catalog.install_tool(spec) is True
+    assert [c[0] for c in calls] == ["git", "uv", "uv"]
+    assert calls[0][:3] == ["git", "clone", "--depth"]
+    assert "openai" in calls[2] and "-e" in calls[2]
+    calls.clear()
+    assert catalog.install_tool(spec) is True and calls == []  # already installed
+
+
+def test_source_launch_runs_from_checkout_with_absolute_paths(monkeypatch, tmp_path):
+    monkeypatch.setenv("GKEY_HOME", str(tmp_path / "home"))
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "in.srt").write_text("x")
+    monkeypatch.chdir(work)
+    spec = catalog.TOOL_BY_ID["gpt-subtrans"]
+    argv, cwd = catalog.source_launch(spec, ["in.srt", "-o", "out.srt", "-l", "Japanese", "--output=o2.srt"])
+    paths = catalog.source_paths(spec)
+    assert cwd == paths["repo"]
+    assert argv[:2] == [str(paths["python"]), str(paths["script"])]
+    assert argv[2:] == [str(work / "in.srt"), "-o", str(work / "out.srt"), "-l", "Japanese", f"--output={work / 'o2.srt'}"]
+
+
+LOBE_RC = '{"entry": "locales/en-US.json", "entryLocale": "en-US", "output": "locales", "outputLocales": ["zh-TW"]}'
+
+
+def test_lobe_i18n_config_saves_immediately(monkeypatch, tmp_path):
+    monkeypatch.setenv("GKEY_HOME", str(tmp_path / "gk"))
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".i18nrc").write_text(LOBE_RC)
+    monkeypatch.chdir(proj)
+    import json
+    args, _ = adapt("lobe-i18n", [])
+    cfg = json.loads(pathlib.Path(args[1]).read_text())
+    assert cfg["saveImmediately"] is True and cfg["modelName"] == "gpt-4o-mini"
+
+
+def test_lobe_i18n_fast_values_reach_the_config(monkeypatch, tmp_path, capsys):
+    """--fast writes GKEY_LOBE_* only into the child env; the merged config must still carry them."""
+    import json
+    monkeypatch.setenv("GKEY_HOME", str(tmp_path / "gk"))
+    monkeypatch.setenv("GKEY_FAST", "1")
+    monkeypatch.delenv("GKEY_LOBE_CONCURRENCY", raising=False)
+    monkeypatch.delenv("GKEY_LOBE_SPLIT_TOKEN", raising=False)
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".i18nrc").write_text(LOBE_RC)
+    monkeypatch.chdir(proj)
+    monkeypatch.setattr(catalog, "install_tool", lambda spec: True)
+    seen = {}
+    monkeypatch.setattr(catalog.os, "execvp", lambda f, a: seen.update(argv=a))
+    catalog.adapt_and_exec(PORT, MODEL, ["lobe-i18n"])
+    cfg = json.loads(pathlib.Path(seen["argv"][2]).read_text())
+    assert cfg["concurrency"] == 8 and cfg["splitToken"] == 3000
+    # without --fast nothing is injected
+    monkeypatch.setenv("GKEY_FAST", "")
+    for k in ("GKEY_LOBE_CONCURRENCY", "GKEY_LOBE_SPLIT_TOKEN"):
+        monkeypatch.delenv(k, raising=False)
+    args, _ = adapt("lobe-i18n", [])
+    cfg = json.loads(pathlib.Path(args[1]).read_text())
+    assert "concurrency" not in cfg and "splitToken" not in cfg
+
+
+def test_fabric_downloads_patterns_once(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("GKEY_HOME", str(tmp_path / "gk"))
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        assert kw.get("stdin") is subprocess.DEVNULL and kw.get("stdout") is sys.stderr  # never eat piped input / pollute stdout
+        d = tmp_path / "home" / ".config" / "fabric" / "patterns" / "summarize"
+        d.mkdir(parents=True)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(catalog.subprocess, "run", fake_run)
+    adapt("fabric", ["-p", "summarize"])
+    assert calls == [["fabric", "-U"]]
+    adapt("fabric", ["-p", "summarize"])
+    assert calls == [["fabric", "-U"]]  # patterns exist now: not repeated
+
+
+def test_fabric_patterns_skipped_for_help_and_explicit_update(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("GKEY_HOME", str(tmp_path / "gk"))
+    monkeypatch.setattr(catalog.subprocess, "run", lambda *a, **k: pytest.fail("must not run fabric -U"))
+    for extra in (["-U"], ["--setup"], ["-h"]):
+        adapt("fabric", extra)
+
+
+def test_fabric_patterns_failure_only_warns(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("GKEY_HOME", str(tmp_path / "gk"))
+    monkeypatch.setattr(catalog.subprocess, "run", lambda cmd, **k: subprocess.CompletedProcess(cmd, 1))
+    adapt("fabric", ["-L"])
+    assert "fabric -U` failed" in capsys.readouterr().err
+
+
+def test_no_model_tools_skip_the_proxy():
+    assert catalog.TOOL_BY_ID["markitdown"].no_model is True
+    assert [t.id for t in catalog.TOOLS if t.no_model] == ["markitdown"]
+    run = lambda tool: subprocess.run([sys.executable, str(ROOT / "catalog.py"), "needs-proxy", tool]).returncode
+    assert run("markitdown") == 1
+    assert run("fabric") == 0 and run("unknown-tool") == 0
+
+
+def test_gkey_launcher_does_not_start_proxy_for_markitdown(tmp_path):
+    """Runs the real `gkey` script with a fake python for catalog.py: no server.py start for no_model tools."""
+    log = tmp_path / "calls.log"
+    fake = tmp_path / "fakepy"
+    fake.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "$@" >> {log}\n'
+        'case "$2" in needs-proxy) [[ "$3" == markitdown ]] && exit 1 || exit 0;; esac\n'
+        'exit 0\n'
+    )
+    fake.chmod(0o755)
+    import os
+    env = dict(os.environ, GKEY_PYTHON=str(fake), GKEY_HOME=str(tmp_path / "home"), GKEY_PORT="18999")
+    r = subprocess.run(["bash", str(ROOT / "gkey"), "markitdown", "x.pdf"], env=env, capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    calls = log.read_text()
+    assert "server.py" not in calls and " adapt 18999" in calls
