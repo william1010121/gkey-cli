@@ -41,7 +41,7 @@ function needsVenv(args) {
     if (a.startsWith("-")) continue;
     return true; // a tool name
   }
-  return args.length > 0; // bare `gkey` opens the menu (stdlib only)
+  return false; // bare `gkey` (menu) or option-only invocations need only the stdlib
 }
 
 function ensureVenv(python) {
