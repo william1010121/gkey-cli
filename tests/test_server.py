@@ -28,8 +28,23 @@ def make_backend(server, agy_bin):
     return b
 
 
+async def settle(backend):
+    """Let background warm-ups/closes finish before asyncio.run() tears the loop down.
+
+    Cancelling a replenish task while `create_subprocess_exec` is still starting the child makes
+    asyncio wait for that child to exit (CPython behaviour), and the fake agy blocks on stdin, so
+    asyncio.run()'s cancel-all step hangs. Production never tears the loop down mid-spawn.
+    """
+    await asyncio.gather(*list(getattr(backend, "_bg_tasks", ())), return_exceptions=True)
+    await asyncio.sleep(0.3)
+    await backend.shutdown()
+
+
 async def collect(backend):
-    return [d async for d in backend.stream_chat([{"role": "user", "content": "hi"}])]
+    try:
+        return [d async for d in backend.stream_chat([{"role": "user", "content": "hi"}])]
+    finally:
+        await settle(backend)
 
 
 def test_happy_path(server, tmp_path):

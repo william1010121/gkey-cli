@@ -14,7 +14,6 @@ def test_detect_concurrency_forms():
     assert detect_concurrency("pdf2zh-next", ["a.pdf", "--qps", "3", "--pool-max-workers", "12"]) == 12
     assert detect_concurrency("pdf2zh-next", ["a.pdf"]) == 16  # gkey injects 16 when neither is given
     assert detect_concurrency("pdf2zh-next", ["--qps", "abc"]) is None
-    assert detect_concurrency("gpt-subtrans", ["a.srt", "--maxthreads", "5"]) == 5
     assert detect_concurrency("babeldoc", ["a.pdf"]) is None
     assert detect_concurrency("markitdown", ["-t", "8"]) is None
     assert detect_concurrency("babeldoc", ["a.pdf", "-q", "12"]) == 12

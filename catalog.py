@@ -128,13 +128,14 @@ TOOLS: list[ToolSpec] = [
         install_cmd='uv tool install --with "bitstring<5" BabelDOC',
         usage_examples=[
             "gkey babeldoc paper.pdf",
-            "gkey babeldoc --files paper.pdf --lang-out zh-TW",
+            "gkey babeldoc --files paper.pdf --lang-out ja   # Traditional Chinese (zh-TW) is the default",
             "gkey babeldoc paper.pdf --qps 8 --pool-max-workers 24   # gkey grows its worker pool to match (cap 16)",
             "gkey babeldoc paper.pdf --no-auto-extract-glossary      # skip the extra glossary LLM pass (faster)",
         ],
         default_prompt_hint="Append a PDF path, e.g. paper.pdf",
         auto_adapt_note=(
             "Rewrites a positional PDF to `--files` and injects `--openai --openai-model --openai-base-url --openai-api-key`. "
+            "Adds `--lang-out zh-TW` unless you pass `--lang-out` or `-lo` (BabelDOC's own default is `zh`, Simplified Chinese). "
             "Speed: default is `--qps 4`; `--qps`/`-q` and `--pool-max-workers` grow gkey's pool. "
             "Fast profile: `--qps 8 --pool-max-workers 24 --no-auto-extract-glossary` (the glossary pass costs one extra LLM sweep over the whole document; "
             "terminology consistency is slightly lower without it). Paragraph batching is built in and not configurable."
@@ -408,7 +409,7 @@ TOOLS: list[ToolSpec] = [
 SPEED: dict = {
     "pdf2zh-next": {
         # gkey already injects --qps/--pool-max-workers 16 when neither is given (adapt_args runs first), so this
-        # profile only matters when the user passed one of them; it fills in the other and sizes the pool.
+        # profile mostly just sizes the pool; a user-given --qps/--pool-max-workers wins over both (see CONCURRENCY_FLAGS).
         "fast": {"flags": ["--qps", "16", "--pool-max-workers", "16"], "pool": 16},
     },
 }
@@ -782,6 +783,10 @@ def adapt_args(spec: ToolSpec, args: List[str], port: str, model: str, env: dict
             args.extend(
                 ["--openai", "--openai-model", model, "--openai-base-url", base_url, "--openai-api-key", api_key]
             )
+        # BabelDOC's own default is `zh` (Simplified); gkey translates to Traditional Chinese unless
+        # the user passes --lang-out / -lo (also --lang-out=xx, -lo=xx, -loxx).
+        if not _has_flag(args, "--lang-out", "-lo"):
+            args.extend(["--lang-out", PDF2ZH_DEFAULT_LANG_OUT])
 
     elif spec.id == "marker_single":
         if "--use_llm" not in args:

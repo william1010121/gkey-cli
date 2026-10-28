@@ -91,6 +91,16 @@ def test_babeldoc_positional_pdf_rewritten():
     assert LOCAL_API_KEY in args
 
 
+def test_babeldoc_default_lang_out_zh_tw_and_user_wins():
+    args, _ = adapt("babeldoc", ["paper.pdf"])
+    assert args[args.index("--lang-out") + 1] == "zh-TW" and args.count("--lang-out") == 1
+    for user in (["--lang-out", "ja"], ["--lang-out=ja"], ["-lo", "ja"], ["-lo=ja"], ["-loja"]):
+        args, _ = adapt("babeldoc", ["paper.pdf"] + user)
+        assert not ("zh-TW" in args), user
+    args, _ = adapt("babeldoc", ["paper.pdf", "-li", "en"])  # -li must not be mistaken for -lo
+    assert "zh-TW" in args
+
+
 def test_bbook_maker_book_name_and_language(monkeypatch):
     monkeypatch.setenv("GKEY_TARGET_LANG", "Japanese")
     args, _ = adapt("bbook_maker", ["book.epub", "--test"])

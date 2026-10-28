@@ -10,6 +10,10 @@ Catalog contract (all keys optional; tools without them keep working unchanged):
 or, without touching the ToolSpec entry, the top-level ``catalog.SPEED[tool_id]`` dict with the
 same keys (``fast``, ``batch_flag``, ``per_file``). The ToolSpec attribute wins when both exist.
 
+Extra ``fast`` keys: ``subcommands`` (list; the profile applies only when the first argument is one
+of them, e.g. videocaptioner ``subtitle``/``process``) and ``skip_if_any`` (list of flags; when the
+user passed any of them the whole profile, flags and env, is skipped, e.g. bbook_maker ``--resume``).
+
 Rules: flags/env are only added when the user did not pass/set them (user always wins); ``pool``
 is the minimum proxy worker pool; ``per_file`` marks a tool that takes one input file per run, so
 ``--parallel-files N`` may split several inputs into N concurrent runs. ``value_flags`` lists
@@ -84,6 +88,19 @@ def fast_flag_names(tool_id: str, profile: dict, name: str) -> List[str]:
     return names
 
 
+def profile_skipped(profile: Optional[dict], args: Sequence[str]) -> Optional[str]:
+    """Reason the fast profile must not be applied to `args` (None = applies)."""
+    if not profile:
+        return None
+    subs = profile.get("subcommands")
+    if subs and (not args or args[0] not in subs):
+        return f"profile only applies to subcommand {'/'.join(subs)}; nothing added"
+    skip = [f for f in (profile.get("skip_if_any") or []) if has_flag(args, [f])]
+    if skip:
+        return f"{' / '.join(skip)} given; fast profile skipped"
+    return None
+
+
 def apply_fast(tool_id: str, args: List[str], profile: Optional[dict], env: dict,
                environ: Optional[dict] = None) -> "tuple[List[str], List[str]]":
     """Inject the profile's flags/env unless the user set them. Returns (args, human notes)."""
@@ -92,9 +109,12 @@ def apply_fast(tool_id: str, args: List[str], profile: Optional[dict], env: dict
     if not profile:
         return list(args), ["no tuned profile for this tool yet; running with its defaults"]
     out = list(args)
+    why = profile_skipped(profile, args)
+    if why:
+        return out, [why]
     added: List[str] = []
     for grp in _groups(profile.get("flags") or []):
-        if grp[0].startswith("-") and not has_flag(out, fast_flag_names(tool_id, profile, grp[0])):
+        if grp[0].startswith("-") and not has_flag(args, fast_flag_names(tool_id, profile, grp[0])):
             out.extend(grp)
             added.extend(grp)
     for k, v in (profile.get("env") or {}).items():
@@ -127,7 +147,7 @@ def speed_pool_hint(spec: Any, args: Sequence[str], table: Optional[dict] = None
     per_run = 1
     if opts["fast"]:
         prof = tool_config(spec, "fast", table)
-        if prof:
+        if prof and not profile_skipped(prof, args):
             want = int(prof.get("pool") or 0)
             per_run = max(per_run, detect_concurrency(spec.id, list(args) + list(prof.get("flags") or [])) or 1)
     if opts["parallel"]:
