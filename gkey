@@ -59,7 +59,9 @@ Usage:
   gkey info <tool>                      Show details, examples and what gkey adapts for a tool
 
 Examples:
-  gkey pdf2zh paper.pdf                 Bilingual paper translation (keeps math and layout)
+  gkey pdf2zh paper.pdf                 Translate a paper to Traditional Chinese (keeps math and layout);
+                                        also writes <name>-zh-TW-then-en.pdf (Chinese pages, then originals)
+  gkey pdf2zh paper.pdf --layout dual   pdf2zh's own outputs only (no merged PDF); -lo ja for another language
   gkey pdf2zh paper.pdf -t 8            8 threads; gkey grows its worker pool to match
   gkey markitdown input.pdf -o out.md   Any document to Markdown
   gkey gpt-subtrans movie.srt -o zh.srt Translate subtitles

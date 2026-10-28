@@ -3,6 +3,8 @@ import re
 import subprocess
 import sys
 
+import pytest
+
 import catalog
 from gkey_common import LOCAL_API_KEY
 
@@ -18,10 +20,36 @@ def adapt(tool, args, monkeypatch=None, tmp_path=None):
 
 
 def test_pdf2zh_gets_service_once():
-    args, _ = adapt("pdf2zh", ["paper.pdf", "-t", "8"])
-    assert args == ["paper.pdf", "-t", "8", "-s", "openai"]
+    args, env = adapt("pdf2zh", ["paper.pdf", "-t", "8"])
+    assert args == ["paper.pdf", "-t", "8", "-s", "openai", "-lo", "zh-TW"]
+    assert env["GKEY_PDF2ZH_LAYOUT"] == "zh-then-en"
     args, _ = adapt("pdf2zh", ["paper.pdf", "-s", "google"])
     assert args.count("-s") == 1 and "openai" not in args
+
+
+def test_pdf2zh_target_language_default_and_override():
+    args, _ = adapt("pdf2zh", ["paper.pdf"])
+    assert args[args.index("-lo") + 1] == "zh-TW"
+    for given in (["-lo", "ja"], ["--lang-out", "ja"], ["--lang-out=ja"], ["-lo=ja"]):
+        args, _ = adapt("pdf2zh", ["paper.pdf"] + given)
+        assert "zh-TW" not in args
+        assert sum(a.startswith(("-lo", "--lang-out")) for a in args) == 1
+
+
+def test_pdf2zh_layout_flag_is_consumed():
+    args, env = adapt("pdf2zh", ["paper.pdf", "--layout", "dual"])
+    assert "--layout" not in args and "dual" not in args and env["GKEY_PDF2ZH_LAYOUT"] == "dual"
+    args, env = adapt("pdf2zh", ["--layout=zh-then-en", "paper.pdf"])
+    assert args[0] == "paper.pdf" and env["GKEY_PDF2ZH_LAYOUT"] == "zh-then-en"
+    with pytest.raises(SystemExit):
+        adapt("pdf2zh", ["paper.pdf", "--layout", "weird"])
+
+
+def test_parse_pdf2zh_args():
+    info = catalog.parse_pdf2zh_args(["a b.pdf", "-p", "1-3", "-t", "8", "-o", "out", "-lo", "zh-TW", "-s", "openai", "c.pdf"])
+    assert info["files"] == ["a b.pdf", "c.pdf"]
+    assert (info["output"], info["pages"], info["lang_out"], info["lang_in"]) == ("out", "1-3", "zh-TW", "en")
+    assert catalog.parse_pdf2zh_args(["--output=x", "--pages=2", "p.pdf"])["output"] == "x"
 
 
 def test_babeldoc_positional_pdf_rewritten():

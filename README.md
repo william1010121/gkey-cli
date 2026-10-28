@@ -47,17 +47,29 @@ $ gkey pdf2zh paper.pdf -t 8
 [gkey] pdf2zh is not installed; installing it now...        # first time only
 [gkey] Proxy ready at http://127.0.0.1:18432/v1             # pool grown to 8 workers to match -t 8
 ...
-paper-mono.pdf   # translated only
-paper-dual.pdf   # bilingual, side by side
+paper-mono.pdf              # Traditional Chinese pages only
+paper-dual.pdf              # bilingual, side by side
+paper-zh-TW-then-en.pdf     # ONE file: all Chinese pages first, then all original pages
 ```
 
-gkey added `-s openai`, pointed the tool at `http://127.0.0.1:18432/v1`, and supplied a placeholder key. You typed none of it.
+gkey added `-s openai` and `-lo zh-TW` (Traditional Chinese is the default; pass `-lo ja` etc. to change it), pointed the tool at `http://127.0.0.1:18432/v1`, and supplied a placeholder key. You typed none of it.
+
+### pdf2zh output layout
+
+`gkey pdf2zh paper.pdf` translates to Traditional Chinese (zh-TW) and, by default (`--layout zh-then-en`), also writes
+`<name>-zh-TW-then-en.pdf`: the whole translated document followed by the whole original, not interleaved
+(a 16-page paper gives 32 pages). Use `--layout dual` to skip that merged file; `-mono.pdf` and `-dual.pdf` are always kept.
+With `-p 1-5` only the selected original pages are appended. The merge uses PyMuPDF from pdf2zh's own environment.
+
+pdf2zh (1.9.x) writes some page numbers with exponents (`1.89e-16`), which makes MuPDF-based viewers print
+`unknown keyword: '1.89e'` and drop an operator. gkey rewrites those numbers in `-mono.pdf`, `-dual.pdf` and the merged file
+after each run. (It is an upstream pdf2zh bug in `pdfinterp.py`; gkey does not patch pdf2zh itself.)
 
 ## Supported tools
 
 | Tool | What it does | Example |
 | --- | --- | --- |
-| `pdf2zh` | Bilingual paper PDFs; keeps math and layout | `gkey pdf2zh paper.pdf` |
+| `pdf2zh` | Traditional Chinese (zh-TW) paper PDFs; keeps math and layout; Chinese pages then originals | `gkey pdf2zh paper.pdf` |
 | `babeldoc` | Next-gen PDF layout translation | `gkey babeldoc paper.pdf` |
 | `markitdown` | PDF/PPTX/DOCX/XLSX to Markdown | `gkey markitdown in.pdf -o out.md` |
 | `marker_single` | High-accuracy PDF to Markdown (tables, math) | `gkey marker_single paper.pdf` |

@@ -98,3 +98,16 @@ def test_fake_backend_nonstream_and_stream(server):
         assert r.json()["choices"][0]["message"]["content"].startswith("OK")
         r = c.post("/v1/chat/completions", json={"stream": True, "messages": [{"role": "user", "content": "x"}]})
         assert "data: [DONE]" in r.text and "canned" in r.text
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_request_log_line(server, caplog, stream):
+    from starlette.testclient import TestClient
+
+    app = server.create_app("auto", "gemini-3.8-flash-low", "low", 1, 10, fake_backend=True, fake_delay_ms=1)
+    with caplog.at_level("INFO", logger="gkey-proxy"), TestClient(app) as c:
+        r = c.post("/v1/chat/completions", json={"model": "x", "stream": stream, "messages": [{"role": "user", "content": "hello"}]})
+        assert r.status_code == 200
+    lines = [m for m in caplog.messages if m.startswith("REQ ")]
+    assert len(lines) == 1
+    assert f"stream={int(stream)}" in lines[0] and "status=ok" in lines[0] and "in_chars=5" in lines[0]

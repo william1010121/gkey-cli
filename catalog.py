@@ -75,16 +75,24 @@ TOOLS: list[ToolSpec] = [
         aliases=["pdfmathtranslate"],
         repo="https://github.com/Byaidu/PDFMathTranslate",
         summary="Translate papers to bilingual PDFs, keeping math, layout and figures intact",
-        why_useful="Translates arXiv papers without wrecking LaTeX formulas, two-column layout or figure placement. Produces a translated-only PDF and a side-by-side bilingual PDF.",
+        why_useful="Translates arXiv papers into Traditional Chinese (zh-TW) without wrecking LaTeX formulas, two-column layout or figure placement. Produces a translated-only PDF, a side-by-side bilingual PDF, and (default) one PDF with all Chinese pages first, then all original English pages.",
         install_cmd="uv tool install pdf2zh",
         usage_examples=[
-            "gkey pdf2zh paper.pdf",
+            "gkey pdf2zh paper.pdf                 # Traditional Chinese pages, then the original pages",
+            "gkey pdf2zh paper.pdf --layout dual   # keep pdf2zh's own outputs only (no merged PDF)",
+            "gkey pdf2zh paper.pdf -lo ja          # other target language (zh-TW is the default)",
             "gkey pdf2zh paper.pdf -p 1-5          # pages 1-5 only",
             "gkey pdf2zh paper.pdf -t 8            # 8 threads (gkey grows its worker pool to match)",
             "gkey -m gemini-4-argon-medium pdf2zh paper.pdf",
         ],
         default_prompt_hint="Append a PDF path, e.g. paper.pdf",
-        auto_adapt_note="Appends `-s openai` if you did not pass a service.",
+        auto_adapt_note=(
+            "Appends `-s openai` (service) and `-lo zh-TW` (target language) unless you pass them. "
+            "Outputs in the current directory (or -o): <name>-mono.pdf (translated), <name>-dual.pdf (side by side) and, "
+            "with the default `--layout zh-then-en`, <name>-zh-TW-then-en.pdf (all Chinese pages, then all original pages). "
+            "`--layout dual` skips the merged PDF. gkey also rewrites pdf2zh's PDFs to fix the MuPDF "
+            "`unknown keyword: '1.89e'` error (pdf2zh writes numbers with exponents into the page content)."
+        ),
     ),
     ToolSpec(
         id="babeldoc",
@@ -396,6 +404,126 @@ def _ensure_mods_config(base_url: str, model: str) -> pathlib.Path:
     return mods_yml
 
 
+# ---- pdf2zh: target language, merged output layout, post-processing ----------------------------
+
+PDF2ZH_DEFAULT_LANG_OUT = "zh-TW"  # pdf2zh: SourceHanSerifTW font + "Translate ... to zh-TW" prompt
+PDF2ZH_LAYOUTS = ("zh-then-en", "dual")
+# pdf2zh options that take a separate value (so the value is not mistaken for an input file).
+_PDF2ZH_VALUE_FLAGS = {
+    "-p", "--pages", "-li", "--lang-in", "-lo", "--lang-out", "-s", "--service", "-o", "--output",
+    "-t", "--thread", "-c", "--vchar", "-f", "--formula", "--prompt", "--config", "--authorized",
+}
+
+
+def split_pdf2zh_layout(args: List[str]) -> "tuple[List[str], str]":
+    """Remove gkey's own `--layout <zh-then-en|dual>` from args; return (args, layout)."""
+    out: List[str] = []
+    layout = "zh-then-en"
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--layout" or a.startswith("--layout="):
+            if a == "--layout":
+                if i + 1 >= len(args):
+                    sys.stderr.write("[gkey] --layout needs a value: zh-then-en or dual\n")
+                    sys.exit(2)
+                layout = args[i + 1]
+                i += 1
+            else:
+                layout = a.split("=", 1)[1]
+            if layout not in PDF2ZH_LAYOUTS:
+                sys.stderr.write(f"[gkey] Invalid --layout '{layout}': use zh-then-en or dual\n")
+                sys.exit(2)
+        else:
+            out.append(a)
+        i += 1
+    return out, layout
+
+
+def parse_pdf2zh_args(args: List[str]) -> dict:
+    """Pull the bits the post-step needs (inputs, output dir, languages, pages) out of pdf2zh args."""
+    info = {"files": [], "output": "", "lang_in": "en", "lang_out": PDF2ZH_DEFAULT_LANG_OUT, "pages": ""}
+    keys = {"-o": "output", "--output": "output", "-li": "lang_in", "--lang-in": "lang_in",
+            "-lo": "lang_out", "--lang-out": "lang_out", "-p": "pages", "--pages": "pages"}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("--") and "=" in a:
+            k, v = a.split("=", 1)
+            if k in keys:
+                info[keys[k]] = v
+        elif a.startswith("-") and len(a) > 1:
+            if a in _PDF2ZH_VALUE_FLAGS:
+                if a in keys and i + 1 < len(args):
+                    info[keys[a]] = args[i + 1]
+                i += 1
+        else:
+            info["files"].append(a.strip("\"'"))
+        i += 1
+    return info
+
+
+def pdf2zh_python(binary: str) -> Optional[str]:
+    """Interpreter of pdf2zh's own (uv tool) environment: it has PyMuPDF; gkey's venv does not."""
+    path = shutil.which(binary)
+    if path:
+        try:
+            with open(path, "rb") as fh:
+                first = fh.readline().decode("utf-8", "replace").strip()
+            if first.startswith("#!"):
+                parts = first[2:].strip().split()
+                if parts and os.path.exists(parts[0]) and not parts[0].endswith("env"):
+                    return parts[0]
+        except OSError:
+            pass
+    return None
+
+
+def pdf2zh_postprocess(binary: str, args: List[str], layout: str) -> None:
+    """After a successful pdf2zh run: fix MuPDF-breaking numbers, and build the merged PDF."""
+    py = pdf2zh_python(binary)
+    err = sys.stderr
+    if not py:
+        err.write("[gkey] Could not locate pdf2zh's Python; skipping the post-step (outputs are the plain pdf2zh files).\n")
+        return
+    info = parse_pdf2zh_args(args)
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pdf_post.py")
+    outdir = info["output"] or os.getcwd()
+    for f in info["files"]:
+        if not f.lower().endswith(".pdf") or not os.path.isfile(f):
+            continue
+        stem = os.path.splitext(os.path.basename(f))[0]
+        mono = os.path.join(outdir, f"{stem}-mono.pdf")
+        dual = os.path.join(outdir, f"{stem}-dual.pdf")
+        if layout == "zh-then-en" and os.path.isfile(mono):
+            merged = os.path.join(outdir, f"{stem}-{info['lang_out']}-then-{info['lang_in']}.pdf")
+            cmd = [py, "-I", script, "zh-then-en", mono, f, merged] + ([info["pages"]] if info["pages"] else [])
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode == 0:
+                err.write(f"[gkey] Merged PDF ({res.stdout.strip()}): {merged}\n")
+            else:
+                err.write(f"[gkey] Could not build the merged PDF: {res.stderr.strip()[-300:]}\n")
+        existing = [p for p in (mono, dual) if os.path.isfile(p)]
+        if existing:
+            res = subprocess.run([py, "-I", script, "fix"] + existing, capture_output=True, text=True)
+            if res.returncode != 0:
+                err.write(f"[gkey] Could not post-fix pdf2zh outputs: {res.stderr.strip()[-300:]}\n")
+
+
+def run_pdf2zh(binary: str, args: List[str], layout: str) -> int:
+    """Run pdf2zh as a child (not exec) so the post-step can follow."""
+    try:
+        rc = subprocess.run([binary] + args).returncode
+    except FileNotFoundError:
+        sys.stderr.write(f"[gkey] Command not found: {binary}\n")
+        return 127
+    except KeyboardInterrupt:
+        return 130
+    if rc == 0:
+        pdf2zh_postprocess(binary, args, layout)
+    return rc
+
+
 def adapt_args(spec: ToolSpec, args: List[str], port: str, model: str, env: dict) -> List[str]:
     """Return the adapted argv tail and mutate `env` with the variables the tool needs.
 
@@ -407,8 +535,12 @@ def adapt_args(spec: ToolSpec, args: List[str], port: str, model: str, env: dict
     args = list(args)
 
     if spec.id == "pdf2zh":
+        args, layout = split_pdf2zh_layout(args)
+        env["GKEY_PDF2ZH_LAYOUT"] = layout
         if not any(a in ("-s", "--service") or a.startswith("-s=") or a.startswith("--service=") for a in args):
             args.extend(["-s", "openai"])
+        if not any(a == "-lo" or a.startswith("-lo=") or a == "--lang-out" or a.startswith("--lang-out=") for a in args):
+            args.extend(["-lo", PDF2ZH_DEFAULT_LANG_OUT])
 
     elif spec.id == "babeldoc":
         if args and "--files" not in args:
@@ -530,7 +662,10 @@ def adapt_and_exec(port: str, model: str, argv: List[str]) -> None:
                 print(f"  OPENAI_API_KEY={mask_secret(env_updates['OPENAI_API_KEY'])}")
                 sys.exit(0)
 
+    layout = env_updates.pop("GKEY_PDF2ZH_LAYOUT", None)
     os.environ.update(env_updates)
+    if spec is not None and spec.id == "pdf2zh" and layout:
+        sys.exit(run_pdf2zh(cmd_name, args, layout))
     try:
         os.execvp(cmd_name, [cmd_name] + args)
     except FileNotFoundError:

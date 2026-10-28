@@ -681,6 +681,16 @@ def create_app(
         engine_name, backend = get_active_backend()
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
         created = int(time.time())
+        t_start = time.perf_counter()
+        prompt_chars = sum(len(str(m.get("content", ""))) for m in messages)
+
+        def log_req(status: str, ttft: Optional[float], out_chars: int) -> None:
+            # One machine-parsable line per request: `gkey --logs` / bench scripts read these.
+            logger.info(
+                "REQ id=%s engine=%s stream=%d status=%s in_chars=%d out_chars=%d ttft_ms=%s total_ms=%.0f",
+                completion_id[-8:], engine_name, int(stream), status, prompt_chars, out_chars,
+                "-" if ttft is None else f"{ttft * 1000:.0f}", (time.perf_counter() - t_start) * 1000,
+            )
 
         if stream:
             async def sse_generator() -> AsyncIterator[bytes]:
@@ -699,12 +709,17 @@ def create_app(
                 }
                 yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
 
+                ttft: Optional[float] = None
+                n_out = 0
                 try:
                     async for delta in backend.stream_chat(
                         messages=messages,
                         model=req_model,
                         response_format=response_format,
                     ):
+                        if ttft is None:
+                            ttft = time.perf_counter() - t_start
+                        n_out += len(delta)
                         chunk = {
                             "id": completion_id,
                             "object": "chat.completion.chunk",
@@ -721,6 +736,7 @@ def create_app(
                         yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode("utf-8")
                 except Exception as e:
                     logger.exception("Error during streaming chat completion (%s)", engine_name)
+                    log_req("error", ttft, n_out)
                     err_chunk = {
                         "error": {
                             "message": str(e),
@@ -744,6 +760,7 @@ def create_app(
                         }
                     ],
                 }
+                log_req("ok", ttft, n_out)
                 yield f"data: {json.dumps(stop_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
                 yield b"data: [DONE]\n\n"
 
@@ -760,15 +777,20 @@ def create_app(
         # Non-streaming response
         try:
             chunks: list[str] = []
+            ttft_ns: Optional[float] = None
             async for delta in backend.stream_chat(
                 messages=messages,
                 model=req_model,
                 response_format=response_format,
             ):
+                if ttft_ns is None:
+                    ttft_ns = time.perf_counter() - t_start
                 chunks.append(delta)
             full_text = "".join(chunks).strip()
+            log_req("ok", ttft_ns, len(full_text))
         except Exception as e:
             logger.exception("Error during chat completion (%s)", engine_name)
+            log_req("error", None, 0)
             return JSONResponse(
                 {
                     "error": {
