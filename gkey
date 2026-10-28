@@ -1,65 +1,104 @@
 #!/usr/bin/env bash
+# gkey - run OpenAI-compatible CLI tools on your Antigravity login. See README.md.
 set -euo pipefail
 
-GKEY_DIR="/Users/guoshengwei/other/ai-skill-research/gkey"
-PYTHON_BIN="${GKEY_DIR}/.venv/bin/python"
+# Resolve the package directory (follows symlinks, e.g. npm's bin link).
+SELF="${BASH_SOURCE[0]}"
+while [[ -L "${SELF}" ]]; do
+  LINK_DIR="$(cd "$(dirname "${SELF}")" && pwd)"
+  SELF="$(readlink "${SELF}")"
+  [[ "${SELF}" != /* ]] && SELF="${LINK_DIR}/${SELF}"
+done
+GKEY_DIR="$(cd "$(dirname "${SELF}")" && pwd)"
+export GKEY_SELF="${GKEY_DIR}/$(basename "${SELF}")"
+
+GKEY_HOME="${GKEY_HOME:-$HOME/.gkey}"
+export GKEY_HOME
+mkdir -p "${GKEY_HOME}/run" "${GKEY_HOME}/logs"
+
+if [[ -n "${GKEY_PYTHON:-}" ]]; then
+  PYTHON_BIN="${GKEY_PYTHON}"
+elif [[ -x "${GKEY_HOME}/venv/bin/python" ]]; then
+  PYTHON_BIN="${GKEY_HOME}/venv/bin/python"
+else
+  PYTHON_BIN="$(command -v python3 || true)"
+fi
+if [[ -z "${PYTHON_BIN}" ]]; then
+  echo "[gkey] Error: python3 not found. Install Python 3.9+ or run gkey via 'npx gkey-cli'." >&2
+  exit 1
+fi
 SERVER_SCRIPT="${GKEY_DIR}/server.py"
 CATALOG_SCRIPT="${GKEY_DIR}/catalog.py"
+MENU_SCRIPT="${GKEY_DIR}/menu.py"
 
 PORT="${GKEY_PORT:-18432}"
 HOST="${GKEY_HOST:-127.0.0.1}"
 MODEL="${GKEY_MODEL:-gemini-3.8-flash-low}"
 BACKEND="${GKEY_BACKEND:-auto}"
 EFFORT="${GKEY_EFFORT:-low}"
-POOL_SIZE="${GKEY_POOL_SIZE:-4}"
+DEFAULT_POOL="${GKEY_POOL_SIZE:-4}"
+EXPLICIT_POOL=""
+POOL_SIZE="${DEFAULT_POOL}"
 
-PID_FILE="/tmp/gkey-proxy-${PORT}.pid"
-LOG_FILE="/tmp/gkey-proxy-${PORT}.log"
+# Make the venv's tools (e.g. uv) and common user bin dirs visible.
+export PATH="${GKEY_HOME}/venv/bin:$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/go/bin:$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
 
-export PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/go/bin:$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
+set_paths() {
+  PID_FILE="${GKEY_HOME}/run/proxy-${PORT}.pid"
+  LOG_FILE="${GKEY_HOME}/logs/proxy-${PORT}.log"
+}
+set_paths
 
 usage() {
   cat <<EOF
+gkey - run OpenAI-compatible CLI tools on your Antigravity login (no API key needed)
+
 Usage:
-  gkey                                  開啟互動式 fzf 工具選單（含用法預覽、自動安裝與直接執行）
-  gkey [options] <command> [args...]    零配置直接執行任意 OpenAI CLI 工具（未安裝會自動安裝並補齊參數！）
+  gkey                                  Open the tool menu (fzf if installed, built-in otherwise)
+  gkey [options] <tool> [args...]       Run a tool; installs it and fills in the OpenAI flags for you
+  gkey info <tool>                      Show details, examples and what gkey adapts for a tool
 
-Zero-Config Examples (不需手打 -s openai 或 --base-url):
-  gkey pdf2zh paper.pdf                 論文雙語 PDF 翻譯（自動注入 -s openai -t 2）
-  gkey babeldoc paper.pdf               次世代 PDF 雙語排版翻譯
-  gkey markitdown input.pdf -o out.md   微軟萬用文件轉 Markdown
-  gkey marker_single paper.pdf          複雜表格/數學掃描 PDF 轉 Markdown（自動開啟 LLM 校正）
-  gkey gpt-subtrans movie.srt -o zh.srt 字幕檔上下文翻譯成繁體中文
-  gkey bbook_maker book.epub --test     雙語 EPUB 電子書製作（自動補齊 API 參數）
-  gkey ai-renamer ~/Desktop/screenshots 看圖/看 PDF 內容批次自動改檔名
-  cat log.txt | gkey mods "分析根因"     Charmbracelet 終端機管線神器
-  cat note.md | gkey fabric -p summarize Fabric 數百種 Prompt Pattern 管線處理
-  gkey oco                              自動分析 git staged diff 產生 Commit Message
-  gkey gptcommit                        Rust 極速版 Git Commit Message 產生器
-  gkey lobe-i18n                        自動批次翻譯專案多語系 JSON / Markdown
+Examples:
+  gkey pdf2zh paper.pdf                 Bilingual paper translation (keeps math and layout)
+  gkey pdf2zh paper.pdf -t 8            8 threads; gkey grows its worker pool to match
+  gkey markitdown input.pdf -o out.md   Any document to Markdown
+  gkey gpt-subtrans movie.srt -o zh.srt Translate subtitles
+  git diff | gkey mods "review this"    LLM in a UNIX pipe
+  gkey oco                              Commit message from your staged diff
 
-Options (before <command>):
-  -m, --model <model>       切換底層 Antigravity 模型 (預設: ${MODEL})
-                            可選: gemini-3.8-flash-low, gemini-4-argon-medium,
-                                  claude-sonnet-5-5-medium, claude-opus-5-5-medium
-  -b, --backend <mode>      後端引擎: auto | sdk | agy (預設: ${BACKEND})
-  -e, --effort <level>      推理強度: low | medium | high (預設: ${EFFORT})
-  -p, --port <port>         本地代理 Port (預設: ${PORT})
+Options (before <tool>):
+  -m, --model <model>       Antigravity model (default: ${MODEL})
+                            e.g. gemini-3.8-flash-low, gemini-4-argon-medium,
+                                 claude-sonnet-5-5-medium, claude-opus-5-5-medium
+  -b, --backend <mode>      auto | sdk | agy (default: ${BACKEND})
+  -e, --effort <level>      low | medium | high (default: ${EFFORT})
+  -p, --port <port>         Local proxy port (default: ${PORT})
+      --pool-size <n>       Proxy worker pool size, 1-16 (default: ${DEFAULT_POOL}; auto-grows
+                            when the tool's own thread flag, e.g. pdf2zh -t 8, asks for more)
 
-Management flags:
-  --list                    列出內建支援的 14 款精選 CLI 工具與安裝狀態
-  --install <tool>          手動觸發安裝指定的精選工具
-  --status                  查看背景 Proxy 運行狀態
-  --start                   啟動背景 Proxy
-  --stop                    停止背景 Proxy
-  --restart                 重啟背景 Proxy
-  --logs                    查看背景 Proxy 即時日誌 (${LOG_FILE})
-  --env                     印出環境變數 export 指令
+Management:
+  --list                    List the supported tools and install status
+  --install <tool>          Install a tool without running it
+  --status | --start | --stop | --restart
+  --logs                    Follow the proxy log (${LOG_FILE})
+  --env                     Print export lines for the proxy environment
+  -h, --help                This help
+
+Data dir: ${GKEY_HOME} (override with GKEY_HOME). Docs: README.md
 EOF
 }
 
+health_json() {
+  curl -fsS --max-time 1 "http://${HOST}:${PORT}/health" 2>/dev/null || true
+}
+
 is_running() {
-  curl -fsS --max-time 1 "http://${HOST}:${PORT}/health" >/dev/null 2>&1
+  [[ -n "$(health_json)" ]]
+}
+
+# Extract a field from the compact /health JSON: health_field '<json>' key
+health_field() {
+  printf '%s' "$1" | sed -n "s/.*\"$2\":\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p"
 }
 
 stop_daemon() {
@@ -68,20 +107,43 @@ stop_daemon() {
     pid=$(cat "${PID_FILE}" 2>/dev/null || true)
     if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
       kill "${pid}" 2>/dev/null || true
-      for _ in {1..20}; do
-        if ! kill -0 "${pid}" 2>/dev/null; then
-          break
-        fi
+      for _ in {1..30}; do
+        kill -0 "${pid}" 2>/dev/null || break
         sleep 0.1
       done
     fi
     rm -f "${PID_FILE}"
   fi
-  local port_pids
-  port_pids=$(lsof -ti tcp:"${PORT}" 2>/dev/null || true)
-  if [[ -n "${port_pids}" ]]; then
-    kill ${port_pids} 2>/dev/null || true
+  # Only fall back to the port owner when it is one of our own servers.
+  if command -v lsof >/dev/null 2>&1; then
+    local port_pids pid cmd
+    port_pids=$(lsof -ti tcp:"${PORT}" -sTCP:LISTEN 2>/dev/null || true)
+    for pid in ${port_pids}; do
+      cmd=$(ps -o command= -p "${pid}" 2>/dev/null || true)
+      if [[ "${cmd}" == *"server.py"* ]]; then
+        kill "${pid}" 2>/dev/null || true
+      fi
+    done
   fi
+}
+
+# Decide whether the running daemon must be restarted to honour this invocation.
+# Explicit -m/-b/-e flags and --pool-size must match; an auto-sized pool only ever grows.
+daemon_needs_restart() {
+  local h running_pool
+  h="$(health_json)"
+  [[ -z "${h}" ]] && return 1
+  [[ -n "${OPT_MODEL}" && "$(health_field "${h}" default_model)" != "${MODEL}" ]] && return 0
+  [[ -n "${OPT_BACKEND}" && "$(health_field "${h}" backend_mode)" != "${BACKEND}" ]] && return 0
+  [[ -n "${OPT_EFFORT}" && "$(health_field "${h}" effort)" != "${EFFORT}" ]] && return 0
+  running_pool="$(health_field "${h}" pool_size)"
+  running_pool="${running_pool:-0}"
+  if [[ -n "${EXPLICIT_POOL}" ]]; then
+    [[ "${running_pool}" != "${POOL_SIZE}" ]] && return 0
+  else
+    [[ "${running_pool}" -lt "${POOL_SIZE}" ]] && return 0
+  fi
+  return 1
 }
 
 start_daemon() {
@@ -102,244 +164,156 @@ start_daemon() {
   echo "${pid}" >"${PID_FILE}"
 
   local ready=0
-  for _ in {1..50}; do
+  for _ in {1..100}; do
     if is_running; then
       ready=1
       break
     fi
     if ! kill -0 "${pid}" 2>/dev/null; then
-      echo "[gkey] Error: Proxy daemon exited unexpectedly. Logs:" >&2
-      cat "${LOG_FILE}" >&2
+      echo "[gkey] Error: proxy exited unexpectedly. Log (${LOG_FILE}):" >&2
+      tail -n 40 "${LOG_FILE}" >&2
       exit 1
     fi
     sleep 0.1
   done
 
   if [[ "${ready}" -ne 1 ]]; then
-    echo "[gkey] Error: Timed out waiting for proxy on http://${HOST}:${PORT}" >&2
+    echo "[gkey] Error: timed out waiting for the proxy on http://${HOST}:${PORT}" >&2
     exit 1
   fi
 
+  # With the agy backend, wait (bounded) until at least one worker is warm.
+  local h err
   for _ in {1..150}; do
-    local health_json
-    health_json=$(curl -fsS --max-time 1 "http://${HOST}:${PORT}/health" 2>/dev/null || echo "{}")
-    if echo "${health_json}" | grep -q '"active_engine":"sdk"'; then
-      break
-    fi
-    if ! echo "${health_json}" | grep -q '"warm_workers":0'; then
+    h="$(health_json)"
+    [[ "$(health_field "${h}" active_engine)" == "sdk" ]] && break
+    [[ "$(health_field "${h}" warm_workers)" != "0" ]] && break
+    err="$(health_field "${h}" last_warm_error)"
+    if [[ -n "${err}" && "${err}" != "null" ]]; then
+      echo "[gkey] Warning: agy worker failed to start: ${err}" >&2
       break
     fi
     sleep 0.2
   done
 }
 
-interactive_fzf() {
-  if ! command -v fzf >/dev/null 2>&1 || [[ ! -t 0 ]] || [[ ! -t 1 ]]; then
-    echo "=== gkey 精選 14 款 OpenAI CLI 神器清單 ==="
-    "${PYTHON_BIN}" "${CATALOG_SCRIPT}" list
-    echo ""
-    usage
-    exit 0
+ensure_daemon() {
+  if daemon_needs_restart; then
+    echo "[gkey] Restarting proxy to apply new settings (model=${MODEL}, backend=${BACKEND}, effort=${EFFORT}, pool=${POOL_SIZE})" >&2
+    stop_daemon
   fi
-
-  local selected
-  selected=$(
-    "${PYTHON_BIN}" "${CATALOG_SCRIPT}" list | fzf \
-      --ansi \
-      --delimiter=$'\t' \
-      --with-nth=2 \
-      --header="🚀 gkey 工具箱 (Model: ${MODEL}) │ Enter: 選擇並自動安裝/執行 │ Ctrl-I: 僅安裝 │ Esc: 離開" \
-      --preview="${PYTHON_BIN} ${CATALOG_SCRIPT} preview {1}" \
-      --preview-window="right:56%:wrap" \
-      --height="90%" \
-      --layout="reverse" \
-      --border="rounded" \
-      --prompt="🔍 搜尋工具 > " \
-      --bind="ctrl-i:execute(${PYTHON_BIN} ${CATALOG_SCRIPT} install {1})+reload(${PYTHON_BIN} ${CATALOG_SCRIPT} list)" \
-    || true
-  )
-
-  if [[ -z "${selected}" ]]; then
-    exit 0
-  fi
-
-  local tool_id
-  tool_id=$(echo "${selected}" | cut -f1 | tr -d ' ')
-
-  # Ensure installed first
-  "${PYTHON_BIN}" "${CATALOG_SCRIPT}" install "${tool_id}"
-
-  echo ""
-  "${PYTHON_BIN}" "${CATALOG_SCRIPT}" preview "${tool_id}"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  local hint
-  hint=$("${PYTHON_BIN}" "${CATALOG_SCRIPT}" hint "${tool_id}")
-  echo -e "\033[1;36m👉 ${hint}\033[0m"
-  echo -e "\033[90m   (支援 Tab 補齊檔案路徑；若想查看該工具的 --help 請輸入 --help)\033[0m"
-
-  local user_args=""
-  read -e -r -p "gkey ${tool_id} " user_args || true
-
   start_daemon
+}
 
-  if [[ -n "${user_args}" ]]; then
-    # Use eval with array expansion so quoted args work naturally
-    eval "set -- ${user_args}"
-    exec "${PYTHON_BIN}" "${CATALOG_SCRIPT}" adapt "${PORT}" "${MODEL}" "${tool_id}" "$@"
-  else
-    exec "${PYTHON_BIN}" "${CATALOG_SCRIPT}" adapt "${PORT}" "${MODEL}" "${tool_id}"
-  fi
+compute_pool() {
+  # compute_pool [tool args...]: sets POOL_SIZE from the default, --pool-size and the tool's own thread flag.
+  POOL_SIZE="$("${PYTHON_BIN}" "${CATALOG_SCRIPT}" poolsize "${DEFAULT_POOL}" "${EXPLICIT_POOL:--}" "$@" 2>/dev/null || echo "${DEFAULT_POOL}")"
 }
 
 ACTION=""
 INSTALL_TARGET=""
-OVERRIDE_CONFIG=0
+OPT_MODEL=""; OPT_BACKEND=""; OPT_EFFORT=""
+
+need_value() {
+  if [[ $# -lt 2 || -z "${2:-}" ]]; then
+    echo "[gkey] Error: $1 needs a value" >&2
+    exit 1
+  fi
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -m|--model)
-      MODEL="$2"
-      OVERRIDE_CONFIG=1
-      shift 2
-      ;;
-    -b|--backend)
-      BACKEND="$2"
-      OVERRIDE_CONFIG=1
-      shift 2
-      ;;
-    -e|--effort)
-      EFFORT="$2"
-      OVERRIDE_CONFIG=1
-      shift 2
-      ;;
-    -p|--port)
-      PORT="$2"
-      PID_FILE="/tmp/gkey-proxy-${PORT}.pid"
-      LOG_FILE="/tmp/gkey-proxy-${PORT}.log"
-      shift 2
-      ;;
-    --list)
-      ACTION="list"
-      shift
-      ;;
-    --install)
-      ACTION="install"
-      INSTALL_TARGET="${2:-}"
-      shift 2
-      ;;
-    --status)
-      ACTION="status"
-      shift
-      ;;
-    --start)
-      ACTION="start"
-      shift
-      ;;
-    --stop)
-      ACTION="stop"
-      shift
-      ;;
-    --restart)
-      ACTION="restart"
-      shift
-      ;;
-    --logs)
-      ACTION="logs"
-      shift
-      ;;
-    --env)
-      ACTION="env"
-      shift
-      ;;
-    -h|--help)
-      usage
-      exit 0
-      ;;
-    --)
-      shift
-      break
-      ;;
-    -*)
-      echo "[gkey] Unknown option: $1" >&2
-      usage >&2
-      exit 1
-      ;;
-    *)
-      break
-      ;;
+    -m|--model) need_value "$@"; MODEL="$2"; OPT_MODEL=1; shift 2 ;;
+    -b|--backend) need_value "$@"; BACKEND="$2"; OPT_BACKEND=1; shift 2 ;;
+    -e|--effort) need_value "$@"; EFFORT="$2"; OPT_EFFORT=1; shift 2 ;;
+    -p|--port) need_value "$@"; PORT="$2"; set_paths; shift 2 ;;
+    --pool-size) need_value "$@"; EXPLICIT_POOL="$2"; shift 2 ;;
+    --list) ACTION="list"; shift ;;
+    --install) need_value "$@"; ACTION="install"; INSTALL_TARGET="$2"; shift 2 ;;
+    --status) ACTION="status"; shift ;;
+    --start) ACTION="start"; shift ;;
+    --stop) ACTION="stop"; shift ;;
+    --restart) ACTION="restart"; shift ;;
+    --logs) ACTION="logs"; shift ;;
+    --env) ACTION="env"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) echo "[gkey] Unknown option: $1" >&2; usage >&2; exit 1 ;;
+    *) break ;;
   esac
 done
 
+if ! [[ "${PORT}" =~ ^[0-9]+$ ]]; then echo "[gkey] Error: invalid port '${PORT}'" >&2; exit 1; fi
+if [[ -n "${EXPLICIT_POOL}" ]] && ! [[ "${EXPLICIT_POOL}" =~ ^[0-9]+$ ]]; then
+  echo "[gkey] Error: --pool-size must be a positive integer" >&2; exit 1
+fi
+if ! [[ "${DEFAULT_POOL}" =~ ^[0-9]+$ ]]; then DEFAULT_POOL=4; fi
+
+# `gkey info <tool>` / `gkey help [tool]`
+if [[ -z "${ACTION}" && $# -gt 0 ]]; then
+  case "$1" in
+    info|help)
+      if [[ $# -ge 2 ]]; then
+        "${PYTHON_BIN}" "${CATALOG_SCRIPT}" info "$2"
+      else
+        usage
+      fi
+      exit 0 ;;
+  esac
+fi
+
+compute_pool "$@"
 case "${ACTION}" in
   list)
     "${PYTHON_BIN}" "${CATALOG_SCRIPT}" list
-    exit 0
-    ;;
+    exit 0 ;;
   install)
-    if [[ -z "${INSTALL_TARGET}" ]]; then
-      echo "Usage: gkey --install <tool_id>" >&2
-      exit 1
-    fi
     "${PYTHON_BIN}" "${CATALOG_SCRIPT}" install "${INSTALL_TARGET}"
-    exit 0
-    ;;
+    exit 0 ;;
   status)
     if is_running; then
       echo "[gkey] Proxy is RUNNING at http://${HOST}:${PORT}/v1"
-      curl -fsS "http://${HOST}:${PORT}/health" && echo ""
+      health_json; echo ""
     else
       echo "[gkey] Proxy is STOPPED (port ${PORT})"
     fi
-    exit 0
-    ;;
+    exit 0 ;;
   start)
-    start_daemon
-    echo "[gkey] Proxy started at http://${HOST}:${PORT}/v1"
-    curl -fsS "http://${HOST}:${PORT}/health" && echo ""
-    exit 0
-    ;;
+    ensure_daemon
+    echo "[gkey] Proxy ready at http://${HOST}:${PORT}/v1"
+    health_json; echo ""
+    exit 0 ;;
   stop)
     stop_daemon
     echo "[gkey] Proxy stopped."
-    exit 0
-    ;;
+    exit 0 ;;
   restart)
     stop_daemon
     start_daemon
     echo "[gkey] Proxy restarted at http://${HOST}:${PORT}/v1"
-    curl -fsS "http://${HOST}:${PORT}/health" && echo ""
-    exit 0
-    ;;
+    health_json; echo ""
+    exit 0 ;;
   logs)
+    if [[ ! -f "${LOG_FILE}" ]]; then echo "[gkey] No log yet (${LOG_FILE})" >&2; exit 1; fi
     tail -n 100 -f "${LOG_FILE}"
-    exit 0
-    ;;
+    exit 0 ;;
   env)
     cat <<EOF
 export OPENAI_BASE_URL="http://${HOST}:${PORT}/v1"
 export OPENAI_API_BASE="http://${HOST}:${PORT}/v1"
 export OPENAI_API_BASE_URL="http://${HOST}:${PORT}/v1"
 export OPENAI_PROXY_URL="http://${HOST}:${PORT}/v1"
-export OPENAI_API_KEY="gkey-local-placeholder"
+export OPENAI_API_KEY="gkey-local-placeholder"   # public placeholder, not a secret
 export OPENAI_MODEL="${MODEL}"
 EOF
-    exit 0
-    ;;
+    exit 0 ;;
 esac
 
-# If no command provided, launch interactive fzf TUI!
+# No command: open the tool menu.
 if [[ $# -eq 0 ]]; then
-  interactive_fzf
-  exit 0
+  exec "${PYTHON_BIN}" "${MENU_SCRIPT}"
 fi
 
-if [[ "${OVERRIDE_CONFIG}" -eq 1 ]] && is_running; then
-  CURRENT_HEALTH=$(curl -fsS --max-time 1 "http://${HOST}:${PORT}/health" 2>/dev/null || echo "{}")
-  if ! echo "${CURRENT_HEALTH}" | grep -q "\"default_model\":\"${MODEL}\""; then
-    stop_daemon
-  fi
-fi
-
-start_daemon
+ensure_daemon
 
 exec "${PYTHON_BIN}" "${CATALOG_SCRIPT}" adapt "${PORT}" "${MODEL}" "$@"
