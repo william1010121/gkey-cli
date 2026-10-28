@@ -76,7 +76,7 @@ def test_env_based_tools(monkeypatch, tmp_path):
     assert env["OCO_API_KEY"] == LOCAL_API_KEY
     assert env["OCO_API_URL"] == f"http://127.0.0.1:{PORT}/v1"
     _, env = adapt("mods", [], monkeypatch, tmp_path)
-    assert env["MODS_CONFIG"].startswith(str(tmp_path))
+    assert env["XDG_CONFIG_HOME"] == str(tmp_path / "xdg")
 
 
 def test_real_openai_key_is_never_inherited(monkeypatch, capfd):
@@ -137,3 +137,128 @@ def test_no_secret_shaped_strings_in_repo():
             if "tests" in p.parts:
                 continue
             assert not pat.search(p.read_text(encoding="utf-8", errors="ignore")), p
+
+
+# ---- CLI tools: fabric / mods / ai-renamer / oco / gptcommit / lobe-i18n --------------------------
+
+def _home(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("GKEY_HOME", str(tmp_path / "gk"))
+    (tmp_path / "home").mkdir(exist_ok=True)
+
+
+def test_fabric_uses_litellm_vendor_not_responses_api(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    _, env = adapt("fabric", [])
+    assert env["DEFAULT_VENDOR"] == "LiteLLM" and env["DEFAULT_MODEL"] == MODEL
+    assert env["LITELLM_API_BASE_URL"] == f"http://127.0.0.1:{PORT}/v1"
+    assert env["LITELLM_API_KEY"] == LOCAL_API_KEY
+    dotenv = tmp_path / "home" / ".config" / "fabric" / ".env"
+    assert "DEFAULT_VENDOR=LiteLLM" in dotenv.read_text()
+
+
+def test_fabric_env_file_refresh_rules(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    d = tmp_path / "home" / ".config" / "fabric"
+    d.mkdir(parents=True)
+    legacy = "DEFAULT_VENDOR=OpenAI\nOPENAI_API_BASE_URL=http://127.0.0.1:1111/v1\n"
+    (d / ".env").write_text(legacy)
+    adapt("fabric", [])
+    assert "LiteLLM" in (d / ".env").read_text()
+    (d / ".env").write_text("DEFAULT_VENDOR=Anthropic\n")  # user-owned: untouched
+    adapt("fabric", [])
+    assert (d / ".env").read_text() == "DEFAULT_VENDOR=Anthropic\n"
+
+
+def test_mods_yaml_has_no_duplicate_keys(monkeypatch, tmp_path):
+    monkeypatch.setenv("GKEY_HOME", str(tmp_path))
+    for model in ("gpt-4o-mini", "gemini-3.8-flash-low"):
+        env = {}
+        catalog.adapt_args(catalog.TOOL_BY_ID["mods"], [], PORT, model, env)
+        text = (tmp_path / "xdg" / "mods" / "mods.yml").read_text()
+        keys = re.findall(r"^      ([\w.-]+):$", text, re.M)
+        assert keys == [model]
+        assert f"base-url: http://127.0.0.1:{PORT}/v1" in text
+        assert (f'"{model}"' in text) is False
+
+
+def test_mods_config_not_rewritten_when_unchanged(monkeypatch, tmp_path):
+    monkeypatch.setenv("GKEY_HOME", str(tmp_path))
+    adapt("mods", [])
+    f = tmp_path / "xdg" / "mods" / "mods.yml"
+    before = f.stat().st_mtime_ns
+    adapt("mods", [])
+    assert f.stat().st_mtime_ns == before
+
+
+def test_ai_renamer_base_url_has_no_v1_and_private_home(monkeypatch, tmp_path):
+    _home(monkeypatch, tmp_path)
+    args, env = adapt("ai-renamer", ["/tmp/x"])
+    assert f"--base-url=http://127.0.0.1:{PORT}" in args
+    assert not any(a.endswith("/v1") for a in args)
+    assert env["HOME"] == str(tmp_path / "gk" / "ai-renamer-home")
+    args, _ = adapt("ai-renamer", ["--base-url=http://h:1", "x"])
+    assert sum(a.startswith("--base-url") for a in args) == 1
+
+
+def test_gptcommit_without_subcommand_shows_help(monkeypatch, capsys):
+    args, env = adapt("gptcommit", [])
+    assert args == ["--help"] and "subcommand" in capsys.readouterr().err
+    args, _ = adapt("gptcommit", ["install"])
+    assert args == ["install"]
+
+
+def test_lobe_i18n_merged_config(monkeypatch, tmp_path):
+    import json
+    _home(monkeypatch, tmp_path)
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".i18nrc.json").write_text(json.dumps(
+        {"entry": "locales/en.json", "entryLocale": "en", "output": "locales", "outputLocales": ["zh-TW"],
+         "modelName": "gemini-3.8-flash"}))
+    monkeypatch.chdir(proj)
+    monkeypatch.setenv("GKEY_LOBE_CONCURRENCY", "8")
+    monkeypatch.setenv("GKEY_LOBE_SPLIT_TOKEN", "3000")
+    args, env = adapt("lobe-i18n", ["md"])
+    assert args[0] == "-c" and args[2:] == ["md"]
+    merged = json.loads(pathlib.Path(args[1]).read_text())
+    assert merged["modelName"] == "gpt-4o-mini"  # supported model: no NaN splitToken
+    assert (merged["concurrency"], merged["splitToken"]) == (8, 3000)
+    assert merged["entry"] == "locales/en.json"
+    assert env["OPENAI_PROXY_URL"] == f"http://127.0.0.1:{PORT}/v1"
+
+
+def test_lobe_i18n_package_json_and_user_config_flag(monkeypatch, tmp_path):
+    import json
+    _home(monkeypatch, tmp_path)
+    proj = tmp_path / "p2"
+    (proj / "sub").mkdir(parents=True)
+    (proj / "package.json").write_text(json.dumps({"name": "x", "i18n": {"entry": "a", "modelName": "zzz"}}))
+    monkeypatch.chdir(proj / "sub")
+    monkeypatch.delenv("GKEY_LOBE_CONCURRENCY", raising=False)
+    monkeypatch.delenv("GKEY_LOBE_SPLIT_TOKEN", raising=False)
+    args, _ = adapt("lobe-i18n", [])
+    merged = json.loads(pathlib.Path(args[1]).read_text())
+    assert merged["modelName"] == "gpt-4o-mini" and "concurrency" not in merged and "name" not in merged
+    args, _ = adapt("lobe-i18n", ["-c", "mine.json"])
+    assert args == ["-c", "mine.json"]
+
+
+def test_lobe_i18n_without_json_config(monkeypatch, tmp_path, capsys):
+    _home(monkeypatch, tmp_path)
+    (tmp_path / "e").mkdir()
+    (tmp_path / "e" / ".i18nrc.js").write_text("module.exports={}")
+    monkeypatch.chdir(tmp_path / "e")
+    args, _ = adapt("lobe-i18n", [])
+    assert args == [] and "No JSON lobe-i18n config" in capsys.readouterr().err
+
+
+def test_fast_profiles_declared_for_cli_tools():
+    t = catalog.TOOL_BY_ID
+    assert t["fabric"].fast["flags"][0] == "--maxTokens"
+    assert t["mods"].fast["flags"] == ["--no-cache", "--max-retries", "2"]
+    assert t["ai-renamer"].fast["flags"] == ["--frames", "2"]
+    assert t["oco"].fast["env"]["OCO_TOKENS_MAX_INPUT"] == "32768"
+    assert t["gptcommit"].fast["env"]["GPTCOMMIT__OPENAI__RETRIES"] == "1"
+    assert t["lobe-i18n"].fast["env"]["GKEY_LOBE_CONCURRENCY"] == "8"
+    assert all(t[i].fast["pool"] <= 16 for i in ("fabric", "mods", "ai-renamer", "oco", "gptcommit", "lobe-i18n"))
