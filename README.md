@@ -151,7 +151,7 @@ Adding a tool is one `ToolSpec` in `catalog.py` plus a branch in `adapt_args`. T
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt pytest httpx
 .venv/bin/python -m pytest -q
-node --test tests/
+node --test tests/launcher.test.js
 ```
 
 Please keep user-facing text in English, add a test for any new adaptation, and never commit secrets.

@@ -14,7 +14,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test tests/ && python3 -m pytest -q tests"
+    "test": "node --test tests/launcher.test.js && python3 -m pytest -q tests"
   },
   "engines": {
     "node": ">=18"
