@@ -77,12 +77,12 @@ after each run. (It is an upstream pdf2zh bug in `pdfinterp.py`; gkey does not p
 | `bbook_maker` | Bilingual EPUB (PyPI `bbook_maker`); `--parallel-workers N` for chapter parallelism | `gkey bbook_maker book.epub --test` |
 | `epub_to_audiobook` | EPUB to audiobook (macOS TTS); `--worker_count N`, `--no_prompt` for unattended runs | `gkey epub_to_audiobook book.epub out/` |
 | `videocaptioner` | Re-segment and translate Whisper subtitles (runs the real CLI; `subtitle`/`process` accept `--thread-num`, `--batch-size`) | `gkey videocaptioner subtitle in.srt --translator llm --target-language zh-Hant` |
-| `fabric` | Prompt patterns for pipes | `cat a.md \| gkey fabric -p summarize` |
-| `mods` | LLM in UNIX pipes | `git diff \| gkey mods "review"` |
-| `ai-renamer` | Rename files by content | `gkey ai-renamer ~/Desktop/shots` |
-| `oco` | Commit messages from staged diff | `gkey oco` |
-| `gptcommit` | Rust commit message / git hook | `gkey gptcommit` |
-| `lobe-i18n` | Translate locale JSON / Markdown | `gkey lobe-i18n` |
+| `fabric` | Prompt patterns for pipes (uses fabric's LiteLLM vendor: Chat Completions, not `/v1/responses`) | `cat a.md \| gkey fabric -p summarize` |
+| `mods` | LLM in UNIX pipes (settings via `XDG_CONFIG_HOME`; `--no-cache --max-retries 2` in fast mode) | `git diff \| gkey mods "review"` |
+| `ai-renamer` | Rename files by content (base URL without `/v1`; private HOME keeps your `~/ai-renamer.json`; `--frames 2` in fast mode) | `gkey ai-renamer ~/Desktop/shots` |
+| `oco` | Commit messages from staged diff (`OCO_TOKENS_MAX_INPUT=32768` in fast mode) | `gkey oco` |
+| `gptcommit` | Rust commit message / git hook; needs a subcommand, and the hook only uses the proxy when you commit via `gkey git commit` | `gkey gptcommit install` |
+| `lobe-i18n` | Translate locale JSON / Markdown (merged JSON config with a supported `modelName`; `GKEY_LOBE_CONCURRENCY` / `GKEY_LOBE_SPLIT_TOKEN`) | `gkey lobe-i18n` |
 
 `gkey --list` shows install status; `gkey info <tool>` shows details and exactly what gets injected.
 Missing tools are installed on first use via `uv`, `npm`, `go`, `brew` or `cargo` as appropriate.

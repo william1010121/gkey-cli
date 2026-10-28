@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import pathlib
 import shutil
@@ -292,7 +293,8 @@ TOOLS: list[ToolSpec] = [
             "gkey fabric -L                                  # list all built-in patterns",
         ],
         default_prompt_hint="Append fabric args, e.g. -L (list patterns) or -p summarize",
-        auto_adapt_note="Creates `~/.config/fabric/.env` (if missing) with the OpenAI-compatible settings, so `fabric --setup` is not needed.",
+        auto_adapt_note="Uses fabric's LiteLLM vendor (Chat Completions; the OpenAI vendor calls /v1/responses, which gkey does not serve) via `DEFAULT_VENDOR`, `LITELLM_API_KEY`, `LITELLM_API_BASE_URL`; creates `~/.config/fabric/.env` if missing.",
+        fast={"flags": ["--maxTokens", "4096"], "env": {}, "pool": 4},
     ),
     ToolSpec(
         id="mods",
@@ -310,7 +312,8 @@ TOOLS: list[ToolSpec] = [
             'gkey mods "compare Nix and Homebrew in a table"',
         ],
         default_prompt_hint='Append a prompt, e.g. "list handy macOS network debugging commands"',
-        auto_adapt_note="Writes a `mods.yml` (in ~/.gkey/mods) whose `base-url` points at gkey and sets `MODS_CONFIG`.",
+        auto_adapt_note="Writes `mods/mods.yml` under `~/.gkey/xdg` (base-url points at gkey) and sets `XDG_CONFIG_HOME` to it, because mods only reads its settings from the XDG config dir.",
+        fast={"flags": ["--no-cache", "--max-retries", "2"], "env": {}, "pool": 4},
     ),
     ToolSpec(
         id="ai-renamer",
@@ -327,7 +330,8 @@ TOOLS: list[ToolSpec] = [
             "gkey ai-renamer ~/Desktop --language='English'",
         ],
         default_prompt_hint="Append a folder to rename, e.g. ./screenshots",
-        auto_adapt_note="Injects `--provider=openai --api-key=... --base-url=... --model=...`.",
+        auto_adapt_note="Injects `--provider=openai --api-key=... --base-url=http://127.0.0.1:PORT --model=...` (no /v1: the tool appends it) and uses a private HOME so your own `~/ai-renamer.json` is not overwritten.",
+        fast={"flags": ["--frames", "2"], "env": {}, "pool": 4},
     ),
     ToolSpec(
         id="oco",
@@ -345,6 +349,7 @@ TOOLS: list[ToolSpec] = [
         ],
         default_prompt_hint="Press Enter to run oco in the current git repo",
         auto_adapt_note="Sets `OCO_AI_PROVIDER=openai`, `OCO_API_URL`, `OCO_API_KEY`, `OCO_MODEL`.",
+        fast={"flags": [], "env": {"OCO_TOKENS_MAX_INPUT": "32768", "OCO_TOKENS_MAX_OUTPUT": "500"}, "pool": 4},
     ),
     ToolSpec(
         id="gptcommit",
@@ -357,11 +362,13 @@ TOOLS: list[ToolSpec] = [
         why_useful="Native binary, handles large diffs concurrently, and can be installed as a `prepare-commit-msg` hook.",
         install_cmd="brew install zurawiki/brews/gptcommit || cargo install --locked gptcommit",
         usage_examples=[
-            "gkey gptcommit",
+            "gkey gptcommit                                  # show gptcommit's subcommands",
             "gkey gptcommit install                          # install the git hook in this repo",
+            "gkey git commit                                 # the hook inherits gkey's env, so it talks to the proxy",
         ],
-        default_prompt_hint="Press Enter to run gptcommit",
-        auto_adapt_note="Sets `GPTCOMMIT__OPENAI__API_BASE`, `GPTCOMMIT__OPENAI__API_KEY`, `GPTCOMMIT__OPENAI__MODEL`.",
+        default_prompt_hint="Append a subcommand: install | uninstall | config | prepare-commit-msg",
+        auto_adapt_note="Sets `GPTCOMMIT__OPENAI__API_BASE`, `GPTCOMMIT__OPENAI__API_KEY`, `GPTCOMMIT__OPENAI__MODEL`. gptcommit needs a subcommand; with none gkey shows its help. The installed git hook runs plain `gptcommit`, so commit via `gkey git commit` for it to use the proxy.",
+        fast={"flags": [], "env": {"GPTCOMMIT__OPENAI__RETRIES": "1"}, "pool": 4},
     ),
     ToolSpec(
         id="lobe-i18n",
@@ -378,7 +385,9 @@ TOOLS: list[ToolSpec] = [
             "gkey lobe-i18n md                               # translate Markdown docs",
         ],
         default_prompt_hint="Press Enter to run lobe-i18n (or add `md` for Markdown)",
-        auto_adapt_note="Sets `OPENAI_PROXY_URL` (lobe-i18n's proxy variable) and `OPENAI_API_KEY`.",
+        auto_adapt_note="Sets `OPENAI_PROXY_URL` and `OPENAI_API_KEY`, and passes `-c` with a merged copy of your JSON config (`.i18nrc`, `.i18nrc.json`, package.json `i18n`) whose `modelName` is a supported model; `concurrency`/`splitToken` come from `GKEY_LOBE_CONCURRENCY`/`GKEY_LOBE_SPLIT_TOKEN`.",
+        fast={"flags": [], "env": {"GKEY_LOBE_CONCURRENCY": "8", "GKEY_LOBE_SPLIT_TOKEN": "3000"}, "pool": 8},
+        batch_flag=None,
     ),
 ]
 
@@ -433,26 +442,54 @@ def install_tool(spec: ToolSpec) -> bool:
     return True
 
 
+def _atomic_write(path: pathlib.Path, text: str) -> None:
+    """Write via a temp file + rename so concurrent readers never see a truncated file."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+_FABRIC_MARK = "# gkey-managed"
+
+
 def _ensure_fabric_config(base_url: str, api_key: str, model: str) -> None:
+    """Create fabric's .env for the LiteLLM vendor (the OpenAI vendor uses /v1/responses: 404 on gkey).
+
+    A user-written .env is never touched; a stale gkey-written one (marker, or the legacy OpenAI
+    layout pointing at 127.0.0.1) is refreshed. Real env vars win over .env anyway.
+    """
     fabric_dir = pathlib.Path.home() / ".config" / "fabric"
     fabric_dir.mkdir(parents=True, exist_ok=True)
     env_file = fabric_dir / ".env"
-    if not env_file.exists():
-        env_file.write_text(
-            f"DEFAULT_VENDOR=OpenAI\n"
-            f"DEFAULT_MODEL={model}\n"
-            f"OPENAI_API_KEY={api_key}\n"
-            f"OPENAI_API_BASE_URL={base_url}\n",
-            encoding="utf-8",
-        )
+    if env_file.exists():
+        old = env_file.read_text(encoding="utf-8", errors="replace")
+        legacy = "DEFAULT_VENDOR=OpenAI" in old and "OPENAI_API_BASE_URL=http://127.0.0.1" in old
+        if _FABRIC_MARK not in old and not legacy:
+            return
+    _atomic_write(
+        env_file,
+        f"{_FABRIC_MARK}\n"
+        f"DEFAULT_VENDOR=LiteLLM\n"
+        f"DEFAULT_MODEL={model}\n"
+        f"LITELLM_API_KEY={api_key}\n"
+        f"LITELLM_API_BASE_URL={base_url}\n",
+    )
 
 
 def _ensure_mods_config(base_url: str, model: str) -> pathlib.Path:
-    """Write a `mods.yml` whose openai base-url points at gkey; return its path."""
-    mods_dir = gkey_home() / "mods"
+    """Write `<GKEY_HOME>/xdg/mods/mods.yml` pointing at gkey; return the XDG config home.
+
+    mods only reads settings from xdg.ConfigFile("mods/mods.yml"), so the caller must export
+    XDG_CONFIG_HOME=<returned dir>. The file is rewritten atomically, and only when it changed.
+    """
+    xdg_home = gkey_home() / "xdg"
+    mods_dir = xdg_home / "mods"
     mods_dir.mkdir(parents=True, exist_ok=True)
     mods_yml = mods_dir / "mods.yml"
-    mods_yml.write_text(
+    aliases = ["default", "gpt-4o-mini", "gpt-4o"]
+    if model in aliases:  # the model key may not also be an alias / appear twice (yaml.v3 rejects duplicates)
+        aliases.remove(model)
+    text = (
         f"default-api: openai\n"
         f"default-model: {model}\n"
         f"apis:\n"
@@ -461,13 +498,75 @@ def _ensure_mods_config(base_url: str, model: str) -> pathlib.Path:
         f"    api-key-env: OPENAI_API_KEY\n"
         f"    models:\n"
         f"      {model}:\n"
-        f"        aliases: [\"default\", \"gpt-4o-mini\", \"gpt-4o\"]\n"
+        f"        aliases: [{', '.join(chr(34) + a + chr(34) for a in aliases)}]\n"
         f"        max-input-chars: 392000\n"
-        f"      gpt-4o-mini:\n"
-        f"        max-input-chars: 392000\n",
-        encoding="utf-8",
     )
-    return mods_yml
+    try:
+        if mods_yml.read_text(encoding="utf-8") == text:
+            return xdg_home
+    except OSError:
+        pass
+    _atomic_write(mods_yml, text)
+    return xdg_home
+
+
+_LOBE_CONFIG_NAMES = (".i18nrc", ".i18nrc.json")
+_LOBE_MODEL = "gpt-4o-mini"  # must be a key of lobe-i18n's ModelTokens, else splitToken is NaN
+
+
+def _find_lobe_config(start: pathlib.Path):
+    """Search upward like cosmiconfig for a JSON lobe-i18n config. Returns (path, dict, is_pkg) or None."""
+    import json
+
+    for d in [start, *start.parents]:
+        for name in _LOBE_CONFIG_NAMES:
+            f = d / name
+            if f.is_file():
+                try:
+                    data = json.loads(f.read_text(encoding="utf-8"))
+                except ValueError:
+                    return None  # YAML in a plain .i18nrc: leave it to lobe-i18n
+                return (f, data, False) if isinstance(data, dict) else None
+        pkg = d / "package.json"
+        if pkg.is_file():
+            try:
+                data = json.loads(pkg.read_text(encoding="utf-8")).get("i18n")
+            except (ValueError, AttributeError):
+                data = None
+            if isinstance(data, dict):
+                return pkg, data, True
+        if any((d / n).is_file() for n in (".i18nrc.js", ".i18nrc.cjs", ".i18nrc.mjs", ".i18nrc.yaml", ".i18nrc.yml",
+                                           "i18n.config.js", "i18n.config.cjs", "i18n.config.mjs")):
+            return None  # non-JSON config: do not try to merge
+    return None
+
+
+def _lobe_int(name: str) -> Optional[int]:
+    v = os.environ.get(name, "")
+    return int(v) if v.isdigit() and int(v) > 0 else None
+
+
+def _ensure_lobe_config(cwd: Optional[pathlib.Path] = None) -> Optional[pathlib.Path]:
+    """Write a merged copy of the project's JSON config with a supported modelName (and optional
+    concurrency / splitToken); return its path, or None when no JSON config was found."""
+    import json
+
+    found = _find_lobe_config(cwd or pathlib.Path.cwd())
+    if not found:
+        return None
+    src, cfg, _is_pkg = found
+    cfg = dict(cfg)
+    cfg["modelName"] = _LOBE_MODEL
+    conc, split = _lobe_int("GKEY_LOBE_CONCURRENCY"), _lobe_int("GKEY_LOBE_SPLIT_TOKEN")
+    if conc:
+        cfg["concurrency"] = conc
+    if split:
+        cfg["splitToken"] = split
+    out_dir = gkey_home() / "lobe-i18n"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"i18nrc-{hashlib.sha1(str(src).encode()).hexdigest()[:10]}.json"
+    _atomic_write(out, json.dumps(cfg, indent=2) + "\n")
+    return out
 
 
 # ---- pdf2zh: target language, merged output layout, post-processing ----------------------------
@@ -675,21 +774,30 @@ def adapt_args(spec: ToolSpec, args: List[str], port: str, model: str, env: dict
 
     elif spec.id == "fabric":
         _ensure_fabric_config(base_url, api_key, model)
-        env["DEFAULT_VENDOR"] = "OpenAI"
+        # LiteLLM vendor = Chat Completions only; vendor OpenAI posts to /v1/responses (404 here).
+        env["DEFAULT_VENDOR"] = "LiteLLM"
         env["DEFAULT_MODEL"] = model
+        env["LITELLM_API_KEY"] = api_key
+        env["LITELLM_API_BASE_URL"] = base_url
 
     elif spec.id == "mods":
-        env["MODS_CONFIG"] = str(_ensure_mods_config(base_url, model))
+        env["XDG_CONFIG_HOME"] = str(_ensure_mods_config(base_url, model))
 
     elif spec.id == "ai-renamer":
+        # The openai provider requests `${baseURL}/v1/chat/completions`: no /v1 in the base URL.
+        root_url = base_url[: -len("/v1")] if base_url.endswith("/v1") else base_url
         if not any(a.startswith("--provider") for a in args):
             args.append("--provider=openai")
         if not any(a.startswith("--api-key") for a in args):
             args.append(f"--api-key={api_key}")
         if not any(a.startswith("--base-url") for a in args):
-            args.append(f"--base-url={base_url}")
+            args.append(f"--base-url={root_url}")
         if not any(a.startswith("--model") for a in args):
             args.append(f"--model={model}")
+        # ai-renamer persists every flag into ~/ai-renamer.json: give it a private HOME instead.
+        home = gkey_home() / "ai-renamer-home"
+        home.mkdir(parents=True, exist_ok=True)
+        env["HOME"] = str(home)
 
     elif spec.id == "oco":
         env["OCO_AI_PROVIDER"] = "openai"
@@ -701,10 +809,25 @@ def adapt_args(spec: ToolSpec, args: List[str], port: str, model: str, env: dict
         env["GPTCOMMIT__OPENAI__API_KEY"] = api_key
         env["GPTCOMMIT__OPENAI__API_BASE"] = base_url
         env["GPTCOMMIT__OPENAI__MODEL"] = "gpt-4o-mini"
+        if not args:  # clap requires a subcommand: show help instead of a bare usage error
+            sys.stderr.write(
+                "[gkey] gptcommit needs a subcommand: install | uninstall | config | prepare-commit-msg.\n"
+                "[gkey] After `gkey gptcommit install`, commit with `gkey git commit` so the hook uses the gkey proxy.\n"
+            )
+            args = ["--help"]
 
     elif spec.id == "lobe-i18n":
         env["OPENAI_PROXY_URL"] = base_url
         env["OPENAI_API_KEY"] = api_key
+        if not any(a in ("-c", "--config") or a.startswith("--config=") for a in args):
+            merged = _ensure_lobe_config()
+            if merged:
+                args = ["-c", str(merged)] + args
+            else:
+                sys.stderr.write(
+                    "[gkey] No JSON lobe-i18n config found (.i18nrc, .i18nrc.json, package.json \"i18n\"); "
+                    "make sure its modelName is a model lobe-i18n knows (e.g. gpt-4o-mini).\n"
+                )
 
     return args
 
