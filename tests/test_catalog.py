@@ -1,0 +1,111 @@
+import pathlib
+import re
+import subprocess
+import sys
+
+import catalog
+from gkey_common import LOCAL_API_KEY
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+PORT, MODEL = "18432", "gemini-3.8-flash-low"
+
+
+def adapt(tool, args, monkeypatch=None, tmp_path=None):
+    if monkeypatch is not None and tmp_path is not None:
+        monkeypatch.setenv("GKEY_HOME", str(tmp_path))
+    env = {}
+    return catalog.adapt_args(catalog.TOOL_BY_ID[tool], args, PORT, MODEL, env), env
+
+
+def test_pdf2zh_gets_service_once():
+    args, _ = adapt("pdf2zh", ["paper.pdf", "-t", "8"])
+    assert args == ["paper.pdf", "-t", "8", "-s", "openai"]
+    args, _ = adapt("pdf2zh", ["paper.pdf", "-s", "google"])
+    assert args.count("-s") == 1 and "openai" not in args
+
+
+def test_babeldoc_positional_pdf_rewritten():
+    args, _ = adapt("babeldoc", ["paper.pdf"])
+    assert args[:2] == ["--files", "paper.pdf"]
+    assert "--openai-base-url" in args and f"http://127.0.0.1:{PORT}/v1" in args
+    assert LOCAL_API_KEY in args
+
+
+def test_bbook_maker_book_name_and_language(monkeypatch):
+    monkeypatch.setenv("GKEY_TARGET_LANG", "Japanese")
+    args, _ = adapt("bbook_maker", ["book.epub", "--test"])
+    assert args[:2] == ["--book_name", "book.epub"]
+    assert args[args.index("--language") + 1] == "Japanese"
+
+
+def test_user_flags_not_overridden():
+    args, _ = adapt("marker_single", ["a.pdf", "--openai_model", "x"])
+    assert args.count("--openai_model") == 1
+
+
+def test_env_based_tools(monkeypatch, tmp_path):
+    _, env = adapt("oco", [])
+    assert env["OCO_API_KEY"] == LOCAL_API_KEY
+    assert env["OCO_API_URL"] == f"http://127.0.0.1:{PORT}/v1"
+    _, env = adapt("mods", [], monkeypatch, tmp_path)
+    assert env["MODS_CONFIG"].startswith(str(tmp_path))
+
+
+def test_real_openai_key_is_never_inherited(monkeypatch, capfd):
+    real = "sk-proj-REALKEYREALKEYREALKEY1234"
+    monkeypatch.setenv("OPENAI_API_KEY", real)
+    seen = {}
+    monkeypatch.setattr(catalog.os, "execvp", lambda cmd, argv: seen.update(argv=argv, key=catalog.os.environ["OPENAI_API_KEY"]))
+    monkeypatch.setattr(catalog, "install_tool", lambda spec: True)
+    catalog.adapt_and_exec(PORT, MODEL, ["marker_single", "a.pdf"])
+    assert seen["key"] == LOCAL_API_KEY
+    assert real not in " ".join(seen["argv"])
+
+
+def test_videocaptioner_output_never_prints_real_key(monkeypatch, capfd, tmp_path):
+    real = "sk-proj-REALKEYREALKEYREALKEY1234"
+    monkeypatch.setenv("OPENAI_API_KEY", real)
+    monkeypatch.setenv("GKEY_HOME", str(tmp_path))
+    monkeypatch.setattr(catalog, "install_tool", lambda spec: True)
+    try:
+        catalog.adapt_and_exec(PORT, MODEL, ["videocaptioner"])
+    except SystemExit:
+        pass
+    out = capfd.readouterr()
+    assert real not in out.out + out.err
+
+
+def test_help_flags_pass_through(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(catalog.os, "execvp", lambda cmd, argv: seen.update(argv=argv))
+    monkeypatch.setattr(catalog, "install_tool", lambda spec: True)
+    catalog.adapt_and_exec(PORT, MODEL, ["pdf2zh", "--help"])
+    assert seen["argv"] == ["pdf2zh", "--help"]
+
+
+def test_poolsize_cli():
+    out = subprocess.run(
+        [sys.executable, str(ROOT / "catalog.py"), "poolsize", "4", "-", "pdf2zh", "p.pdf", "-t", "8"],
+        stdout=subprocess.PIPE, universal_newlines=True, check=True,
+    ).stdout.strip()
+    assert out == "8"
+
+
+def test_no_cjk_or_personal_paths_in_sources():
+    cjk = re.compile(r"[㐀-鿿　-〿＀-￯]")
+    for name in ["gkey", "catalog.py", "server.py", "menu.py", "gkey_common.py", "bin/gkey.js", "README.md"]:
+        p = ROOT / name
+        if not p.exists():
+            continue
+        text = p.read_text(encoding="utf-8")
+        assert not cjk.search(text), f"CJK text left in {name}"
+        assert "/Users/" not in text, f"hardcoded path in {name}"
+
+
+def test_no_secret_shaped_strings_in_repo():
+    pat = re.compile(r"sk-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{30,}|ghp_[A-Za-z0-9]{30,}")
+    for p in ROOT.rglob("*"):
+        if p.is_file() and ".git" not in p.parts and "node_modules" not in p.parts and p.suffix in {".py", ".js", ".md", ".json", ""}:
+            if "tests" in p.parts:
+                continue
+            assert not pat.search(p.read_text(encoding="utf-8", errors="ignore")), p
