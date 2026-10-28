@@ -85,3 +85,16 @@ def test_health_reports_config(server):
     with TestClient(app) as c:
         h = c.get("/health").json()
     assert h["pool_size"] == 6 and h["effort"] == "high" and h["backend_mode"] == "agy"
+
+
+def test_fake_backend_nonstream_and_stream(server):
+    from starlette.testclient import TestClient
+
+    app = server.create_app("auto", "m", "low", 2, 6, fake_backend=True, fake_delay_ms=1)
+    with TestClient(app) as c:
+        assert c.get("/health").json()["fake_backend"] is True
+        r = c.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "x"}]})
+        assert r.status_code == 200
+        assert r.json()["choices"][0]["message"]["content"].startswith("OK")
+        r = c.post("/v1/chat/completions", json={"stream": True, "messages": [{"role": "user", "content": "x"}]})
+        assert "data: [DONE]" in r.text and "canned" in r.text

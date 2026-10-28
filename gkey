@@ -76,6 +76,12 @@ Options (before <tool>):
       --pool-size <n>       Proxy worker pool size, 1-16 (default: ${DEFAULT_POOL}; auto-grows
                             when the tool's own thread flag, e.g. pdf2zh -t 8, asks for more)
 
+Benchmark (no real model calls unless --bench-real):
+  --bench                   Measure proxy overhead against a fake backend (p50/p95/max, req/s)
+      --concurrency <n>     Parallel clients (default: 4)
+      --requests <m>        Total requests (default: 40)
+  --bench-real              Send ONE tiny prompt per backend (agy, sdk) and print time-to-first-token
+
 Management:
   --list                    List the supported tools and install status
   --install <tool>          Install a tool without running it
@@ -213,6 +219,7 @@ compute_pool() {
 ACTION=""
 INSTALL_TARGET=""
 OPT_MODEL=""; OPT_BACKEND=""; OPT_EFFORT=""
+BENCH_CONC=4; BENCH_REQS=40
 
 need_value() {
   if [[ $# -lt 2 || -z "${2:-}" ]]; then
@@ -228,6 +235,10 @@ while [[ $# -gt 0 ]]; do
     -e|--effort) need_value "$@"; EFFORT="$2"; OPT_EFFORT=1; shift 2 ;;
     -p|--port) need_value "$@"; PORT="$2"; set_paths; shift 2 ;;
     --pool-size) need_value "$@"; EXPLICIT_POOL="$2"; shift 2 ;;
+    --concurrency) need_value "$@"; BENCH_CONC="$2"; shift 2 ;;
+    --requests) need_value "$@"; BENCH_REQS="$2"; shift 2 ;;
+    --bench) ACTION="bench"; shift ;;
+    --bench-real) ACTION="bench-real"; shift ;;
     --list) ACTION="list"; shift ;;
     --install) need_value "$@"; ACTION="install"; INSTALL_TARGET="$2"; shift 2 ;;
     --status) ACTION="status"; shift ;;
@@ -264,6 +275,13 @@ fi
 
 compute_pool "$@"
 case "${ACTION}" in
+  bench|bench-real)
+    for v in "${BENCH_CONC}" "${BENCH_REQS}"; do
+      [[ "${v}" =~ ^[1-9][0-9]*$ ]] || { echo "[gkey] Error: --concurrency/--requests must be positive integers" >&2; exit 1; }
+    done
+    exec "${PYTHON_BIN}" "${GKEY_DIR}/bench.py" "--${ACTION#bench-}" \
+      --concurrency "${BENCH_CONC}" --requests "${BENCH_REQS}" \
+      --pool-size "${EXPLICIT_POOL:-${DEFAULT_POOL}}" --model "${MODEL}" --effort "${EFFORT}" ;;
   list)
     "${PYTHON_BIN}" "${CATALOG_SCRIPT}" list
     exit 0 ;;

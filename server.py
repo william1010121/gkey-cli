@@ -541,6 +541,29 @@ class AgyCLIBackend:
             await w.close()
 
 
+class FakeBackend:
+    """Canned-text backend for latency benchmarking: never calls a real model.
+
+    Honours the same pool limit as the real backends (a semaphore of ``pool_size``) so the
+    measured queueing matches what a real run would see, minus the model time itself.
+    """
+
+    CANNED = ["OK", " - ", "this is ", "canned ", "text."]
+
+    def __init__(self, delay_ms: float = 20.0, pool_size: int = 4) -> None:
+        self.delay = max(0.0, delay_ms) / 1000.0
+        self.pool_size = pool_size
+        self._semaphore: Optional[asyncio.Semaphore] = None
+
+    async def stream_chat(self, messages: list[dict[str, Any]], model: str, response_format: Any = None) -> AsyncIterator[str]:
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self.pool_size)
+        async with self._semaphore:
+            await asyncio.sleep(self.delay)
+            for piece in self.CANNED:
+                yield piece
+
+
 def has_sdk_credentials() -> bool:
     """Checks whether GEMINI_API_KEY or Vertex AI credentials are set for the Python SDK."""
     if not SDK_AVAILABLE:
@@ -558,7 +581,10 @@ def create_app(
     effort: str,
     pool_size: int,
     max_turns_per_worker: int,
+    fake_backend: bool = False,
+    fake_delay_ms: float = 20.0,
 ) -> Starlette:
+    fake = FakeBackend(delay_ms=fake_delay_ms, pool_size=pool_size) if fake_backend else None
     sdk_backend = SDKBackend(default_model=default_model, concurrency=pool_size)
     agy_backend = AgyCLIBackend(
         default_model=default_model,
@@ -567,7 +593,9 @@ def create_app(
         max_turns_per_worker=max_turns_per_worker,
     )
 
-    def get_active_backend() -> tuple[str, SDKBackend | AgyCLIBackend]:
+    def get_active_backend() -> tuple[str, Any]:
+        if fake is not None:
+            return "fake", fake
         if backend_mode == "sdk":
             if not SDK_AVAILABLE:
                 raise RuntimeError("--backend sdk requires the google-antigravity package")
@@ -607,6 +635,7 @@ def create_app(
                 "pool_size": pool_size,
                 "sdk_available": SDK_AVAILABLE,
                 "warm_workers": agy_backend.pool.qsize() if name == "agy" else 0,
+                "fake_backend": fake is not None,
                 "last_warm_error": agy_backend.last_warm_error,
             }
         )
@@ -859,6 +888,18 @@ def main() -> None:
         default=int(os.environ.get("GKEY_MAX_TURNS", "6")),
         help="Max turns per warm agy worker before recycling",
     )
+    parser.add_argument(
+        "--fake-backend",
+        action="store_true",
+        default=os.environ.get("GKEY_FAKE_BACKEND", "") not in ("", "0", "false"),
+        help="Benchmark mode: reply with canned text after a small delay; never calls a model",
+    )
+    parser.add_argument(
+        "--fake-delay-ms",
+        type=float,
+        default=float(os.environ.get("GKEY_FAKE_DELAY_MS", "20")),
+        help="Simulated per-request model delay in fake-backend mode (default 20)",
+    )
     args = parser.parse_args()
     args.pool_size = max(1, min(args.pool_size, MAX_POOL_SIZE))
     if args.host not in ("127.0.0.1", "localhost", "::1"):
@@ -874,6 +915,8 @@ def main() -> None:
         effort=args.effort,
         pool_size=args.pool_size,
         max_turns_per_worker=args.max_turns,
+        fake_backend=args.fake_backend,
+        fake_delay_ms=args.fake_delay_ms,
     )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 

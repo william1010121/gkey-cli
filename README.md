@@ -96,6 +96,24 @@ only controls how many requests the tool sends. To avoid starving it, gkey reads
 restarting the proxy if the running one is smaller. The pool is capped at 16. Override it any time with `--pool-size N`.
 Automatic sizing only ever grows the pool; an explicit `--pool-size` is applied exactly.
 
+### Benchmarking the proxy
+
+```bash
+gkey --bench                                  # 40 requests, 4 at a time
+gkey --bench --concurrency 8 --requests 200 --pool-size 8
+gkey --bench-real                             # opt-in: ONE tiny prompt per backend, prints time-to-first-token
+```
+
+`--bench` starts a throwaway proxy on a free port with `--fake-backend` (also `GKEY_FAKE_BACKEND=1`; delay via
+`GKEY_FAKE_DELAY_MS`, default 20 ms) that answers `/v1/chat/completions` with canned text, streaming and non-streaming.
+It never calls a model and leaves your running proxy alone. It prints p50/p95/max latency, requests/s and the effective pool size.
+
+How to read it: the numbers are **proxy overhead** (HTTP, JSON, SSE, pool queueing), not model latency. When concurrency
+exceeds the pool size, requests queue, so latency is about `ceil(concurrency / pool) x delay`. Real runs add model time
+(seconds), which dominates. To compare backends on real calls, try it yourself with a tiny prompt:
+`gkey -b agy mods "reply with OK"` versus `gkey -b sdk mods "reply with OK"`. `--bench-real` does the same, once per backend,
+and only when you pass it.
+
 ## Configuration
 
 | Variable / flag | Default | Meaning |
