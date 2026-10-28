@@ -1,0 +1,40 @@
+{
+  "name": "gkey-cli",
+  "version": "0.1.0",
+  "description": "Run any OpenAI-compatible CLI tool (pdf2zh, markitdown, fabric, mods, ...) on your Google Antigravity login. No API key, zero config.",
+  "bin": {
+    "gkey": "bin/gkey.js"
+  },
+  "files": [
+    "bin/",
+    "gkey",
+    "*.py",
+    "requirements.txt",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test tests/ && python3 -m pytest -q tests"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "keywords": [
+    "openai-compatible", "openai-proxy", "gemini", "antigravity", "llm", "cli",
+    "pdf-translation", "pdf2zh", "markitdown", "fabric", "mods", "translation",
+    "bilingual", "epub", "subtitles", "zero-config", "no-api-key", "npx"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YOUR_GITHUB_USER/gkey-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/YOUR_GITHUB_USER/gkey-cli/issues"
+  },
+  "homepage": "https://github.com/YOUR_GITHUB_USER/gkey-cli#readme",
+  "license": "MIT"
+}
