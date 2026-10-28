@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Curated Best-in-Class OpenAI CLI Tools Catalog, Auto-Installer & Smart Adapter for `gkey`."""
+"""Tool catalog, auto-installer and argument/env adapter for `gkey`."""
 
 from __future__ import annotations
 
@@ -8,11 +8,22 @@ import pathlib
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import List, Optional
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from gkey_common import (  # noqa: E402
+    LOCAL_API_KEY,
+    compute_pool_size,
+    detect_concurrency,
+    gkey_home,
+    mask_secret,
+)
 
 
 def ensure_extended_path() -> None:
-    """Ensures ~/.local/bin, ~/.npm-global/bin, ~/go/bin, ~/.cargo/bin, /opt/homebrew/bin are in PATH."""
+    """Make sure common user-level bin dirs are on PATH (uv, npm -g, go, cargo, brew)."""
     extra_dirs = [
         os.path.expanduser("~/.local/bin"),
         os.path.expanduser("~/.npm-global/bin"),
@@ -28,19 +39,29 @@ def ensure_extended_path() -> None:
     os.environ["PATH"] = os.pathsep.join(parts)
 
 
+def _color(code: str, text: str, stream=None) -> str:
+    stream = stream or sys.stdout
+    if os.environ.get("NO_COLOR") or not hasattr(stream, "isatty") or not stream.isatty():
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def target_language() -> str:
+    return os.environ.get("GKEY_TARGET_LANG") or "Traditional Chinese"
+
+
 @dataclass
 class ToolSpec:
     id: str
     name: str
     category: str
-    stars: str
     binary: str
-    aliases: list[str]
+    aliases: List[str]
     repo: str
     summary: str
     why_useful: str
     install_cmd: str
-    usage_examples: list[str]
+    usage_examples: List[str]
     default_prompt_hint: str
     auto_adapt_note: str
 
@@ -49,261 +70,248 @@ TOOLS: list[ToolSpec] = [
     ToolSpec(
         id="pdf2zh",
         name="PDFMathTranslate (pdf2zh)",
-        category="1. PDF / 論文翻譯",
-        stars="30k+ ⭐",
+        category="PDF / paper translation",
         binary="pdf2zh",
         aliases=["pdfmathtranslate"],
         repo="https://github.com/Byaidu/PDFMathTranslate",
-        summary="保留 LaTeX 數學公式、雙欄排版與圖表的論文雙語 PDF 翻譯神器",
-        why_useful="看 arXiv 論文唯一不會把 LaTeX 數學公式、雙欄排版、圖表位置弄爛的翻譯工具，跑完直接生成「純譯文」與「中英雙語對照」兩份 PDF。",
+        summary="Translate papers to bilingual PDFs, keeping math, layout and figures intact",
+        why_useful="Translates arXiv papers without wrecking LaTeX formulas, two-column layout or figure placement. Produces a translated-only PDF and a side-by-side bilingual PDF.",
         install_cmd="uv tool install pdf2zh",
         usage_examples=[
             "gkey pdf2zh paper.pdf",
-            "gkey pdf2zh paper.pdf -p 1-5          # 只翻第 1~5 頁",
+            "gkey pdf2zh paper.pdf -p 1-5          # pages 1-5 only",
+            "gkey pdf2zh paper.pdf -t 8            # 8 threads (gkey grows its worker pool to match)",
             "gkey -m gemini-4-argon-medium pdf2zh paper.pdf",
         ],
-        default_prompt_hint="請輸入 PDF 檔案路徑 (例如 paper.pdf)",
-        auto_adapt_note="自動補上 `-s openai`（無須手動輸入 -s openai！）",
+        default_prompt_hint="Append a PDF path, e.g. paper.pdf",
+        auto_adapt_note="Appends `-s openai` if you did not pass a service.",
     ),
     ToolSpec(
         id="babeldoc",
         name="BabelDOC",
-        category="1. PDF / 論文翻譯",
-        stars="新一代引擎 ⭐",
+        category="PDF / paper translation",
         binary="babeldoc",
         aliases=[],
         repo="https://github.com/funstory-ai/BabelDOC",
-        summary="PDFMathTranslate 團隊新一代高精度 PDF 雙語排版翻譯引擎",
-        why_useful="PDFMathTranslate 的次世代底層引擎，針對複雜跨欄段落與學術論文版面重構更精準。",
+        summary="Next-generation, high-precision bilingual PDF layout translation engine",
+        why_useful="The successor engine to PDFMathTranslate, better at complex cross-column paragraphs and academic layouts.",
         install_cmd="uv tool install BabelDOC",
         usage_examples=[
             "gkey babeldoc paper.pdf",
             "gkey babeldoc --files paper.pdf --lang-out zh-TW",
         ],
-        default_prompt_hint="請輸入 PDF 檔案路徑 (例如 paper.pdf)",
-        auto_adapt_note="自動將位置參數轉為 `--files` 並注入 `--openai --openai-model --openai-base-url --openai-api-key`",
+        default_prompt_hint="Append a PDF path, e.g. paper.pdf",
+        auto_adapt_note="Rewrites a positional PDF to `--files` and injects `--openai --openai-model --openai-base-url --openai-api-key`.",
     ),
     ToolSpec(
         id="markitdown",
         name="MarkItDown (Microsoft)",
-        category="1. PDF / 文件轉 MD",
-        stars="190k+ ⭐",
+        category="Document to Markdown",
         binary="markitdown",
         aliases=[],
         repo="https://github.com/microsoft/markitdown",
-        summary="微軟官方維護：把 PDF、PPTX、DOCX、XLSX、圖片一次轉成乾淨 Markdown",
-        why_useful="幾乎是目前把各種雜亂辦公室文件（PDF、PPTX、DOCX、XLSX、HTML、ZIP）一次轉成乾淨 Markdown 的業界標準。",
+        summary="Convert PDF, PPTX, DOCX, XLSX and images to clean Markdown",
+        why_useful="Turns messy office documents (PDF, PPTX, DOCX, XLSX, HTML, ZIP) into clean Markdown in one command.",
         install_cmd='uv tool install "markitdown[all]"',
         usage_examples=[
             "gkey markitdown input.pdf -o output.md",
             "gkey markitdown slides.pptx -o slides.md",
             "gkey markitdown report.docx",
         ],
-        default_prompt_hint="請輸入文件路徑與輸出 (例如 input.pdf -o output.md)",
-        auto_adapt_note="自動注入 `OPENAI_API_KEY` 與 `OPENAI_BASE_URL`",
+        default_prompt_hint="Append an input file and optional output, e.g. input.pdf -o output.md",
+        auto_adapt_note="Sets `OPENAI_API_KEY` and `OPENAI_BASE_URL`.",
     ),
     ToolSpec(
         id="marker_single",
         name="Marker",
-        category="1. PDF / 文件轉 MD",
-        stars="25k+ ⭐",
+        category="Document to Markdown",
         binary="marker_single",
         aliases=["marker"],
         repo="https://github.com/VikParuchuri/marker",
-        summary="掃描檔、跨頁複雜表格、滿滿數學公式 PDF 轉 Markdown 最強工具",
-        why_useful="結合本地深度排版模型 + 外部 OpenAI LLM 校正，處理跨頁表格與複雜 LaTeX 數學公式準確率最高。",
+        summary="High-accuracy PDF to Markdown for scans, tables and math",
+        why_useful="Combines local layout models with an LLM pass to handle cross-page tables and complex LaTeX with the best accuracy.",
         install_cmd="uv tool install marker-pdf",
         usage_examples=[
             "gkey marker_single paper.pdf",
             "gkey marker_single paper.pdf --output_dir ./md_out",
         ],
-        default_prompt_hint="請輸入 PDF 檔案路徑 (例如 paper.pdf)",
-        auto_adapt_note="自動注入 `--use_llm --llm_service marker.services.openai.OpenAIService --openai_api_key --openai_base_url --openai_model`",
+        default_prompt_hint="Append a PDF path, e.g. paper.pdf",
+        auto_adapt_note="Injects `--use_llm --llm_service marker.services.openai.OpenAIService --openai_api_key --openai_base_url --openai_model`.",
     ),
     ToolSpec(
         id="gpt-subtrans",
         name="llm-subtrans (gpt-subtrans)",
-        category="2. 字幕 / 電子書翻譯",
-        stars="專用字幕 CLI ⭐",
+        category="Subtitles / e-books / audio",
         binary="gpt-subtrans",
         aliases=["llm-subtrans"],
         repo="https://github.com/machinewrapped/llm-subtrans",
-        summary="純 CLI 將 .srt / .ass 字幕檔結合上下文翻成通順繁中且絕不弄亂時間軸",
-        why_useful="已經有 .srt 或 .ass 字幕檔時，用批次前後文滑動視窗翻成通順的繁體中文，且 100% 保持時間軸對齊。",
+        summary="Context-aware .srt / .ass subtitle translation that keeps timing intact",
+        why_useful="Translates existing subtitle files with a sliding context window, giving fluent output while keeping timestamps aligned.",
         install_cmd='uv tool install --with openai "git+https://github.com/machinewrapped/llm-subtrans.git"',
         usage_examples=[
             "gkey gpt-subtrans movie.srt -o movie.zh.srt",
-            "gkey gpt-subtrans movie.srt -l 'Traditional Chinese' -o movie.zh.srt",
+            "gkey gpt-subtrans movie.srt -l 'Japanese' -o movie.ja.srt",
         ],
-        default_prompt_hint="請輸入字幕檔路徑 (例如 input.srt -o output.srt)",
-        auto_adapt_note="自動注入 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`-l Traditional Chinese`",
+        default_prompt_hint="Append a subtitle path, e.g. input.srt -o output.srt",
+        auto_adapt_note="Sets `OPENAI_API_KEY`, `OPENAI_BASE_URL` and `-l <GKEY_TARGET_LANG>` (default: Traditional Chinese).",
     ),
     ToolSpec(
         id="bbook_maker",
         name="bilingual_book_maker",
-        category="2. 字幕 / 電子書翻譯",
-        stars="14k+ ⭐",
+        category="Subtitles / e-books / audio",
         binary="bbook_maker",
         aliases=["bilingual_book_maker"],
         repo="https://github.com/yihong0618/bilingual_book_maker",
-        summary="丟一本外文 .epub 進去，直接吐出保留排版的「中英雙語對照 .epub」電子書",
-        why_useful="保留原本 EPUB 章節結構與插圖，生成段落對照雙語電子書，支援 `--test` 先試翻前幾段。",
+        summary="Turn a foreign-language .epub into a bilingual .epub",
+        why_useful="Keeps chapter structure and illustrations and produces paragraph-aligned bilingual books. `--test` translates only the first few paragraphs as a preview.",
         install_cmd="uv tool install bilingual_book_maker",
         usage_examples=[
             "gkey bbook_maker book.epub",
-            "gkey bbook_maker book.epub --test              # 只試翻前 10 段確認效果",
-            "gkey bbook_maker --book_name book.epub --language 'Traditional Chinese'",
+            "gkey bbook_maker book.epub --test              # preview the first few paragraphs",
+            "gkey bbook_maker --book_name book.epub --language 'Japanese'",
         ],
-        default_prompt_hint="請輸入電子書路徑 (例如 book.epub --test)",
-        auto_adapt_note="自動將 `book.epub` 轉為 `--book_name book.epub` 並補上 `--openai_key`、`--api_base`、`--language Traditional Chinese`",
+        default_prompt_hint="Append an e-book path, e.g. book.epub --test",
+        auto_adapt_note="Turns `book.epub` into `--book_name book.epub` and adds `--openai_key`, `--api_base`, `--language <GKEY_TARGET_LANG>`.",
     ),
     ToolSpec(
         id="epub_to_audiobook",
         name="epub_to_audiobook",
-        category="2. 字幕 / 電子書翻譯",
-        stars="有聲書神器 ⭐",
+        category="Subtitles / e-books / audio",
         binary="epub_to_audiobook",
         aliases=[],
         repo="https://github.com/p0n1/epub_to_audiobook",
-        summary="把 .epub 電子書按章節切開，轉成帶完整章節書籤的有聲書",
-        why_useful="自動解析 EPUB 章節並對接 `gkey` 內建的 `/v1/audio/speech` 本地語音合成端點生成有聲書。",
+        summary="Convert an .epub into an audiobook with chapter bookmarks",
+        why_useful="Parses EPUB chapters and speaks them through gkey's local /v1/audio/speech endpoint (macOS only: uses `say`).",
         install_cmd='uv tool install "git+https://github.com/p0n1/epub_to_audiobook.git"',
         usage_examples=[
             "gkey epub_to_audiobook book.epub ./audiobook_out",
         ],
-        default_prompt_hint="請輸入 <輸入.epub> <輸出資料夾> (例如 book.epub ./out)",
-        auto_adapt_note="自動補上 `--tts openai` 並由 `gkey` 內建 `/v1/audio/speech` 提供語音合成",
+        default_prompt_hint="Append <input.epub> <output-dir>, e.g. book.epub ./out",
+        auto_adapt_note="Appends `--tts openai`; speech is served by gkey's built-in /v1/audio/speech (macOS only).",
     ),
     ToolSpec(
         id="videocaptioner",
-        name="VideoCaptioner (卡卡字幕助手)",
-        category="2. 字幕 / 電子書翻譯",
-        stars="熱門影音字幕 ⭐",
+        name="VideoCaptioner",
+        category="Subtitles / e-books / audio",
         binary="videocaptioner",
         aliases=["videolingo"],
         repo="https://github.com/WEIFENG2333/VideoCaptioner",
-        summary="解決 Whisper 碎字幕問題，用 LLM 自動智慧斷句並生成雙語字幕",
-        why_useful="自動將語音辨識後的破碎字幕智慧斷句成符合人類閱讀習慣的單行雙語字幕。",
-        install_cmd="mkdir -p ~/.local/share/gkey && (test -d ~/.local/share/gkey/VideoCaptioner || git clone --depth 1 https://github.com/WEIFENG2333/VideoCaptioner.git ~/.local/share/gkey/VideoCaptioner)",
+        summary="LLM-powered sentence splitting and bilingual subtitles for Whisper output",
+        why_useful="Re-segments choppy speech-recognition subtitles into natural single-line bilingual subtitles.",
+        install_cmd='mkdir -p "${GKEY_HOME:-$HOME/.gkey}/tools" && (test -d "${GKEY_HOME:-$HOME/.gkey}/tools/VideoCaptioner" || git clone --depth 1 https://github.com/WEIFENG2333/VideoCaptioner.git "${GKEY_HOME:-$HOME/.gkey}/tools/VideoCaptioner")',
         usage_examples=[
             "gkey videocaptioner",
         ],
-        default_prompt_hint="直接按 Enter 啟動 (已注入 OPENAI_BASE_URL 與 OPENAI_API_KEY)",
-        auto_adapt_note="自動設定 `OPENAI_BASE_URL` 與 `OPENAI_API_KEY` 環境變數",
+        default_prompt_hint="Press Enter to set up VideoCaptioner",
+        auto_adapt_note="Clones the repo into ~/.gkey/tools and prints the OPENAI_BASE_URL / OPENAI_API_KEY to use (key masked).",
     ),
     ToolSpec(
         id="fabric",
         name="Fabric",
-        category="3. UNIX 管線 / 批次處理",
-        stars="30k+ ⭐",
+        category="UNIX pipes / batch",
         binary="fabric",
         aliases=["fabric-ai"],
         repo="https://github.com/danielmiessler/fabric",
-        summary="內建數百種高頻 Prompt Pattern（論文提煉、會議記錄、YouTube 摘要）的 UNIX 管線神器",
-        why_useful="Go 重寫版極快！一行 `cat paper.md | gkey fabric -p extract_wisdom` 或分析 Log 跑完即結束，完全不囉嗦。",
+        summary="Hundreds of ready-made prompt patterns for UNIX pipelines",
+        why_useful="One line like `cat paper.md | gkey fabric -p extract_wisdom` summarizes papers, meetings, logs and videos.",
         install_cmd="go install github.com/danielmiessler/fabric/cmd/fabric@latest",
         usage_examples=[
             "cat article.md | gkey fabric -p summarize",
             "cat meeting.txt | gkey fabric -p extract_wisdom",
-            "gkey fabric -L                                  # 列出所有內建 Pattern",
+            "gkey fabric -L                                  # list all built-in patterns",
         ],
-        default_prompt_hint="請輸入 fabric 參數 (例如 -L 列出所有 Pattern，或 -p summarize)",
-        auto_adapt_note="自動建立 `~/.config/fabric/.env` 並注入 OpenAI Compatible 設定，免跑 `fabric --setup`",
+        default_prompt_hint="Append fabric args, e.g. -L (list patterns) or -p summarize",
+        auto_adapt_note="Creates `~/.config/fabric/.env` (if missing) with the OpenAI-compatible settings, so `fabric --setup` is not needed.",
     ),
     ToolSpec(
         id="mods",
         name="Mods (Charmbracelet)",
-        category="3. UNIX 管線 / 批次處理",
-        stars="Charm 出品 ⭐",
+        category="UNIX pipes / batch",
         binary="mods",
         aliases=[],
         repo="https://github.com/charmbracelet/mods",
-        summary="極簡純粹的 UNIX 管線 LLM 工具，最適合洗 git diff、kubectl logs 或 CSV/JSON",
-        why_useful="當你在寫 Shell Script 需要把 `git diff`、`error.log` 丟進去洗成乾淨 Markdown 表格時，穩定度最高的工業級 CLI。",
+        summary="Minimal LLM for UNIX pipes: git diff, logs, CSV/JSON",
+        why_useful="Pipe `git diff`, `error.log` or JSON into it and get clean Markdown back; a stable choice for shell scripts.",
         install_cmd="brew install charmbracelet/tap/mods || go install github.com/charmbracelet/mods@latest",
         usage_examples=[
-            'git diff | gkey mods "總結這次變更並檢查有無潛在 Bug"',
-            'cat error.log | gkey mods "找出根因並列出修復指令"',
-            'gkey mods "用表格比較 Nix 與 Homebrew 的差異"',
+            'git diff | gkey mods "summarize this change and flag potential bugs"',
+            'cat error.log | gkey mods "find the root cause and list fix commands"',
+            'gkey mods "compare Nix and Homebrew in a table"',
         ],
-        default_prompt_hint='請輸入提示詞 (例如 "用表格列出 macOS 常用網路除錯指令")',
-        auto_adapt_note="自動配置 `mods.yml` 的 `base-url` 並注入 `MODS_API=openai` 與 `MODS_MODEL`",
+        default_prompt_hint='Append a prompt, e.g. "list handy macOS network debugging commands"',
+        auto_adapt_note="Writes a `mods.yml` (in ~/.gkey/mods) whose `base-url` points at gkey and sets `MODS_CONFIG`.",
     ),
     ToolSpec(
         id="ai-renamer",
         name="ai-renamer",
-        category="3. UNIX 管線 / 批次處理",
-        stars="2.1k+ ⭐",
+        category="UNIX pipes / batch",
         binary="ai-renamer",
         aliases=[],
         repo="https://github.com/ozgrozer/ai-renamer",
-        summary="自動讀取圖片與 PDF 內容，將亂碼截圖/掃描檔批次改名成有意義的檔名",
-        why_useful="專門對付桌面和 Downloads 資料夾裡一堆 `IMG_0293.png`、`scan_01.pdf`，自動看內容改名成可讀檔名。",
+        summary="Rename screenshots, images and PDFs based on their content",
+        why_useful="Cleans up folders full of `IMG_0293.png` and `scan_01.pdf` by reading the content and giving each file a readable name.",
         install_cmd="npm install -g ai-renamer",
         usage_examples=[
-            "gkey ai-renamer ./ folder_to_rename",
-            "gkey ai-renamer ~/Desktop --language='Traditional Chinese'",
+            "gkey ai-renamer ~/Desktop/screenshots",
+            "gkey ai-renamer ~/Desktop --language='English'",
         ],
-        default_prompt_hint="請輸入要批次改名的資料夾路徑 (例如 ./screenshots)",
-        auto_adapt_note="自動注入 `--provider=openai --api-key=... --base-url=... --model=gpt-4o-mini`",
+        default_prompt_hint="Append a folder to rename, e.g. ./screenshots",
+        auto_adapt_note="Injects `--provider=openai --api-key=... --base-url=... --model=...`.",
     ),
     ToolSpec(
         id="oco",
         name="OpenCommit (oco)",
-        category="4. Git / 專案多語系",
-        stars="Node 生態最火 ⭐",
+        category="Git / i18n",
         binary="oco",
         aliases=["opencommit"],
         repo="https://github.com/di-sukharev/opencommit",
-        summary="根據 git staged diff 在 1~2 秒內自動生成專業 Commit Message",
-        why_useful="在 Git 專案中 `git add` 後直接跑 `gkey oco`，自動讀取 staged diff 生成符合規範的 commit 訊息。",
+        summary="Generate commit messages from your staged diff in seconds",
+        why_useful="After `git add`, run `gkey oco` to turn the staged diff into a well-formed commit message.",
         install_cmd="npm install -g opencommit",
         usage_examples=[
             "gkey oco",
-            "gkey oco --fgm                                  # 使用完整 GitMoji 規範",
+            "gkey oco --fgm                                  # full GitMoji spec",
         ],
-        default_prompt_hint="直接按 Enter 在當前 Git Repo 執行 oco",
-        auto_adapt_note="自動注入 `OCO_AI_PROVIDER=openai`、`OCO_API_URL`、`OCO_API_KEY`、`OCO_MODEL`",
+        default_prompt_hint="Press Enter to run oco in the current git repo",
+        auto_adapt_note="Sets `OCO_AI_PROVIDER=openai`, `OCO_API_URL`, `OCO_API_KEY`, `OCO_MODEL`.",
     ),
     ToolSpec(
         id="gptcommit",
         name="gptcommit (Rust)",
-        category="4. Git / 專案多語系",
-        stars="Rust 極速版 ⭐",
+        category="Git / i18n",
         binary="gptcommit",
         aliases=[],
         repo="https://github.com/zurawiki/gptcommit",
-        summary="Rust 編寫的極速 Git Commit Message 產生器与 git hook 工具",
-        why_useful="Rust 原生執行檔極快、支援併發處理大型 diff，可掛載為 `prepare-commit-msg` hook。",
+        summary="Fast Rust commit-message generator and git hook",
+        why_useful="Native binary, handles large diffs concurrently, and can be installed as a `prepare-commit-msg` hook.",
         install_cmd="brew install zurawiki/brews/gptcommit || cargo install --locked gptcommit",
         usage_examples=[
             "gkey gptcommit",
-            "gkey gptcommit install                          # 在當前 repo 安裝 git hook",
+            "gkey gptcommit install                          # install the git hook in this repo",
         ],
-        default_prompt_hint="直接按 Enter 執行 gptcommit",
-        auto_adapt_note="自動注入 `GPTCOMMIT__OPENAI__API_BASE`、`GPTCOMMIT__OPENAI__API_KEY`、`GPTCOMMIT__OPENAI__MODEL`",
+        default_prompt_hint="Press Enter to run gptcommit",
+        auto_adapt_note="Sets `GPTCOMMIT__OPENAI__API_BASE`, `GPTCOMMIT__OPENAI__API_KEY`, `GPTCOMMIT__OPENAI__MODEL`.",
     ),
     ToolSpec(
         id="lobe-i18n",
         name="lobe-i18n (LobeHub)",
-        category="4. Git / 專案多語系",
-        stars="i18n 翻譯神器 ⭐",
+        category="Git / i18n",
         binary="lobe-i18n",
         aliases=[],
         repo="https://github.com/lobehub/lobe-cli-toolbox",
-        summary="自動將專案語系檔 (JSON) 或 Markdown 批次翻譯成十幾種語言",
-        why_useful="維護開源專案或 App 時，跑一行 `gkey lobe-i18n` 或 `gkey lobe-i18n md` 即可利用滑動視窗自動同步多語系檔案。",
+        summary="Batch-translate locale JSON files or Markdown into many languages",
+        why_useful="Keeps a project's locale files in sync with a sliding-window translator: `gkey lobe-i18n` or `gkey lobe-i18n md`.",
         install_cmd="npm install -g @lobehub/i18n-cli",
         usage_examples=[
             "gkey lobe-i18n",
-            "gkey lobe-i18n md                               # 批次翻譯 Markdown 文件",
+            "gkey lobe-i18n md                               # translate Markdown docs",
         ],
-        default_prompt_hint="直接按 Enter 執行 lobe-i18n (或輸入 md 翻譯 Markdown)",
-        auto_adapt_note="自動注入 `OPENAI_PROXY_URL`（lobe-i18n 專用代理變數）與 `OPENAI_API_KEY`",
+        default_prompt_hint="Press Enter to run lobe-i18n (or add `md` for Markdown)",
+        auto_adapt_note="Sets `OPENAI_PROXY_URL` (lobe-i18n's proxy variable) and `OPENAI_API_KEY`.",
     ),
 ]
 
-TOOL_BY_ID: dict[str, ToolSpec] = {}
+TOOL_BY_ID: dict = {}
 for _t in TOOLS:
     TOOL_BY_ID[_t.id] = _t
     TOOL_BY_ID[_t.binary] = _t
@@ -311,12 +319,15 @@ for _t in TOOLS:
         TOOL_BY_ID[_alias] = _t
 
 
-def is_tool_installed(spec: ToolSpec) -> str | None:
+def videocaptioner_dir() -> pathlib.Path:
+    return gkey_home() / "tools" / "VideoCaptioner"
+
+
+def is_tool_installed(spec: ToolSpec) -> Optional[str]:
     ensure_extended_path()
     if spec.id == "videocaptioner":
-        vc_dir = os.path.expanduser("~/.local/share/gkey/VideoCaptioner")
-        if os.path.isdir(vc_dir):
-            return vc_dir
+        vc_dir = videocaptioner_dir()
+        return str(vc_dir) if vc_dir.is_dir() else None
     path = shutil.which(spec.binary)
     if path:
         return path
@@ -329,25 +340,22 @@ def is_tool_installed(spec: ToolSpec) -> str | None:
 
 def install_tool(spec: ToolSpec) -> bool:
     ensure_extended_path()
-    installed_path = is_tool_installed(spec)
-    if installed_path:
+    if is_tool_installed(spec):
         return True
 
-    sys.stderr.write(
-        f"\n\033[1;36m📦 [gkey] 偵測到尚未安裝 {spec.name} ({spec.binary})，正在自動為您安裝...\033[0m\n"
-    )
-    sys.stderr.write(f"\033[90m   執行: {spec.install_cmd}\033[0m\n\n")
-    sys.stderr.flush()
+    err = sys.stderr
+    err.write(f"\n[gkey] {spec.name} ({spec.binary}) is not installed; installing it now...\n")
+    err.write(f"[gkey] running: {spec.install_cmd}\n\n")
+    err.flush()
 
     res = subprocess.run(spec.install_cmd, shell=True)
     if res.returncode != 0:
-        sys.stderr.write(
-            f"\n\033[1;31m❌ [gkey] 安裝 {spec.name} 失敗 (exit code {res.returncode})\033[0m\n"
-        )
+        err.write(f"\n[gkey] Failed to install {spec.name} (exit code {res.returncode}).\n")
+        err.write(f"[gkey] You can install it manually: {spec.install_cmd}\n")
         return False
 
     ensure_extended_path()
-    sys.stderr.write(f"\n\033[1;32m✅ [gkey] {spec.name} 安裝完成！\033[0m\n\n")
+    err.write(f"\n[gkey] {spec.name} installed.\n\n")
     return True
 
 
@@ -365,9 +373,9 @@ def _ensure_fabric_config(base_url: str, api_key: str, model: str) -> None:
         )
 
 
-def _ensure_mods_config(base_url: str, model: str) -> None:
-    """Ensures Charmbracelet `mods` has a config file whose openai base-url points to gkey."""
-    mods_dir = pathlib.Path("/tmp/gkey-mods-config")
+def _ensure_mods_config(base_url: str, model: str) -> pathlib.Path:
+    """Write a `mods.yml` whose openai base-url points at gkey; return its path."""
+    mods_dir = gkey_home() / "mods"
     mods_dir.mkdir(parents=True, exist_ok=True)
     mods_yml = mods_dir / "mods.yml"
     mods_yml.write_text(
@@ -385,10 +393,107 @@ def _ensure_mods_config(base_url: str, model: str) -> None:
         f"        max-input-chars: 392000\n",
         encoding="utf-8",
     )
+    return mods_yml
 
 
-def adapt_and_exec(port: str, model: str, argv: list[str]) -> None:
-    """Adapts CLI arguments and environment variables for the target tool, auto-installing if needed."""
+def adapt_args(spec: ToolSpec, args: List[str], port: str, model: str, env: dict) -> List[str]:
+    """Return the adapted argv tail and mutate `env` with the variables the tool needs.
+
+    Pure apart from the config-file helpers for fabric/mods; unit-testable.
+    """
+    base_url = f"http://127.0.0.1:{port}/v1"
+    api_key = LOCAL_API_KEY
+    lang = target_language()
+    args = list(args)
+
+    if spec.id == "pdf2zh":
+        if not any(a in ("-s", "--service") or a.startswith("-s=") or a.startswith("--service=") for a in args):
+            args.extend(["-s", "openai"])
+
+    elif spec.id == "babeldoc":
+        if args and "--files" not in args:
+            new_args: List[str] = []
+            for a in args:
+                if not a.startswith("-") and a.lower().endswith(".pdf"):
+                    new_args.extend(["--files", a])
+                else:
+                    new_args.append(a)
+            args = new_args
+        if "--openai" not in args:
+            args.extend(
+                ["--openai", "--openai-model", model, "--openai-base-url", base_url, "--openai-api-key", api_key]
+            )
+
+    elif spec.id == "marker_single":
+        if "--use_llm" not in args:
+            args.append("--use_llm")
+        if "--llm_service" not in args:
+            args.extend(["--llm_service", "marker.services.openai.OpenAIService"])
+        if "--openai_api_key" not in args:
+            args.extend(["--openai_api_key", api_key])
+        if "--openai_base_url" not in args:
+            args.extend(["--openai_base_url", base_url])
+        if "--openai_model" not in args:
+            args.extend(["--openai_model", model])
+
+    elif spec.id == "gpt-subtrans":
+        if not any(a in ("-l", "--target_language") for a in args):
+            args.extend(["-l", lang])
+
+    elif spec.id == "bbook_maker":
+        if args and not args[0].startswith("-") and "--book_name" not in args:
+            args = ["--book_name", args[0]] + args[1:]
+        if "--openai_key" not in args:
+            args.extend(["--openai_key", api_key])
+        if "--api_base" not in args:
+            args.extend(["--api_base", base_url])
+        if "--model" not in args:
+            args.extend(["--model", "gpt-4o-mini"])
+        if "--language" not in args:
+            args.extend(["--language", lang])
+
+    elif spec.id == "epub_to_audiobook":
+        if "--tts" not in args:
+            args.extend(["--tts", "openai"])
+
+    elif spec.id == "fabric":
+        _ensure_fabric_config(base_url, api_key, model)
+        env["DEFAULT_VENDOR"] = "OpenAI"
+        env["DEFAULT_MODEL"] = model
+
+    elif spec.id == "mods":
+        env["MODS_CONFIG"] = str(_ensure_mods_config(base_url, model))
+
+    elif spec.id == "ai-renamer":
+        if not any(a.startswith("--provider") for a in args):
+            args.append("--provider=openai")
+        if not any(a.startswith("--api-key") for a in args):
+            args.append(f"--api-key={api_key}")
+        if not any(a.startswith("--base-url") for a in args):
+            args.append(f"--base-url={base_url}")
+        if not any(a.startswith("--model") for a in args):
+            args.append(f"--model={model}")
+
+    elif spec.id == "oco":
+        env["OCO_AI_PROVIDER"] = "openai"
+        env["OCO_API_KEY"] = api_key
+        env["OCO_API_URL"] = base_url
+        env["OCO_MODEL"] = "gpt-4o-mini"
+
+    elif spec.id == "gptcommit":
+        env["GPTCOMMIT__OPENAI__API_KEY"] = api_key
+        env["GPTCOMMIT__OPENAI__API_BASE"] = base_url
+        env["GPTCOMMIT__OPENAI__MODEL"] = "gpt-4o-mini"
+
+    elif spec.id == "lobe-i18n":
+        env["OPENAI_PROXY_URL"] = base_url
+        env["OPENAI_API_KEY"] = api_key
+
+    return args
+
+
+def adapt_and_exec(port: str, model: str, argv: List[str]) -> None:
+    """Install (if needed), adapt arguments/environment, then exec the target tool."""
     ensure_extended_path()
     if not argv:
         sys.exit(1)
@@ -397,200 +502,119 @@ def adapt_and_exec(port: str, model: str, argv: list[str]) -> None:
     args = list(argv[1:])
 
     base_url = f"http://127.0.0.1:{port}/v1"
-    server_root = f"http://127.0.0.1:{port}"
-    api_key = os.environ.get("OPENAI_API_KEY", "gkey-local-placeholder")
-
-    # Universal OpenAI-compatible environment variables
-    os.environ["OPENAI_BASE_URL"] = base_url
-    os.environ["OPENAI_API_BASE"] = base_url
-    os.environ["OPENAI_API_BASE_URL"] = base_url
-    os.environ["OPENAI_PROXY_URL"] = base_url
-    os.environ["OPENAI_API_KEY"] = api_key
-    os.environ["OPENAI_MODEL"] = model
+    # Never inherit a real OPENAI_API_KEY: the local proxy ignores keys, and we do
+    # not want to hand (or print) the user's real key to third-party tools.
+    env_updates = {
+        "OPENAI_BASE_URL": base_url,
+        "OPENAI_API_BASE": base_url,
+        "OPENAI_API_BASE_URL": base_url,
+        "OPENAI_PROXY_URL": base_url,
+        "OPENAI_API_KEY": LOCAL_API_KEY,
+        "OPENAI_MODEL": model,
+    }
 
     spec = TOOL_BY_ID.get(cmd_name)
     if spec is not None:
         if not install_tool(spec):
             sys.exit(1)
-        # Always use the canonical binary name if an alias was used
         cmd_name = spec.binary
 
-        # Help flags pass through untouched
+        # Help/version flags pass through untouched
         is_help = any(a in ("-h", "--help", "-v", "--version") for a in args)
-
         if not is_help:
-            if spec.id == "pdf2zh":
-                # Auto-inject `-s openai` if not provided by user
-                if not any(a in ("-s", "--service") or a.startswith("-s=") for a in args):
-                    args.extend(["-s", "openai"])
-
-            elif spec.id == "babeldoc":
-                # If user passed `gkey babeldoc paper.pdf`, rewrite positional pdf to `--files paper.pdf`
-                if args and not any(a == "--files" for a in args):
-                    new_args: list[str] = []
-                    for a in args:
-                        if not a.startswith("-") and a.lower().endswith(".pdf"):
-                            new_args.extend(["--files", a])
-                        else:
-                            new_args.append(a)
-                    args = new_args
-                if "--openai" not in args:
-                    args.extend(
-                        [
-                            "--openai",
-                            "--openai-model",
-                            model,
-                            "--openai-base-url",
-                            base_url,
-                            "--openai-api-key",
-                            api_key,
-                        ]
-                    )
-
-            elif spec.id == "marker_single":
-                if "--use_llm" not in args:
-                    args.append("--use_llm")
-                if "--llm_service" not in args:
-                    args.extend(["--llm_service", "marker.services.openai.OpenAIService"])
-                if "--openai_api_key" not in args:
-                    args.extend(["--openai_api_key", api_key])
-                if "--openai_base_url" not in args:
-                    args.extend(["--openai_base_url", base_url])
-                if "--openai_model" not in args:
-                    args.extend(["--openai_model", model])
-
-            elif spec.id == "gpt-subtrans":
-                os.environ["OPENAI_MODEL"] = model
-                if not any(a in ("-l", "--target_language") for a in args):
-                    args.extend(["-l", "Traditional Chinese"])
-
-            elif spec.id == "bbook_maker":
-                # Allow `gkey bbook_maker book.epub` without typing `--book_name`
-                if args and not args[0].startswith("-") and "--book_name" not in args:
-                    args = ["--book_name", args[0]] + args[1:]
-                if "--openai_key" not in args:
-                    args.extend(["--openai_key", api_key])
-                if "--api_base" not in args:
-                    args.extend(["--api_base", base_url])
-                if "--model" not in args:
-                    args.extend(["--model", "gpt-4o-mini"])
-                if "--language" not in args:
-                    args.extend(["--language", "Traditional Chinese"])
-
-            elif spec.id == "epub_to_audiobook":
-                if "--tts" not in args:
-                    args.extend(["--tts", "openai"])
-
-            elif spec.id == "fabric":
-                _ensure_fabric_config(base_url, api_key, model)
-                os.environ["DEFAULT_VENDOR"] = "OpenAI"
-                os.environ["DEFAULT_MODEL"] = model
-
-            elif spec.id == "mods":
-                _ensure_mods_config(base_url, model)
-                os.environ["MODS_CONFIG"] = "/tmp/gkey-mods-config/mods.yml"
-
-            elif spec.id == "ai-renamer":
-                if not any(a.startswith("--provider") for a in args):
-                    args.append("--provider=openai")
-                if not any(a.startswith("--api-key") for a in args):
-                    args.append(f"--api-key={api_key}")
-                if not any(a.startswith("--base-url") for a in args):
-                    args.append(f"--base-url={base_url}")
-                if not any(a.startswith("--model") for a in args):
-                    args.append(f"--model={model}")
-
-            elif spec.id == "oco":
-                os.environ["OCO_AI_PROVIDER"] = "openai"
-                os.environ["OCO_API_KEY"] = api_key
-                os.environ["OCO_API_URL"] = base_url
-                os.environ["OCO_MODEL"] = "gpt-4o-mini"
-
-            elif spec.id == "gptcommit":
-                os.environ["GPTCOMMIT__OPENAI__API_KEY"] = api_key
-                os.environ["GPTCOMMIT__OPENAI__API_BASE"] = base_url
-                os.environ["GPTCOMMIT__OPENAI__MODEL"] = "gpt-4o-mini"
-
-            elif spec.id == "lobe-i18n":
-                os.environ["OPENAI_PROXY_URL"] = base_url
-                os.environ["OPENAI_API_KEY"] = api_key
-
-            elif spec.id == "videocaptioner":
-                vc_dir = os.path.expanduser("~/.local/share/gkey/VideoCaptioner")
-                print(f"✅ VideoCaptioner 目錄: {vc_dir}")
-                print(f"   已自動注入 OPENAI_BASE_URL={base_url} 與 OPENAI_API_KEY={api_key}")
+            args = adapt_args(spec, args, port, model, env_updates)
+            if spec.id == "videocaptioner":
+                print(f"VideoCaptioner is installed at: {videocaptioner_dir()}")
+                print("Configure it with an OpenAI-compatible provider:")
+                print(f"  OPENAI_BASE_URL={env_updates['OPENAI_BASE_URL']}")
+                print(f"  OPENAI_API_KEY={mask_secret(env_updates['OPENAI_API_KEY'])}")
                 sys.exit(0)
 
-    os.execvp(cmd_name, [cmd_name] + args)
+    os.environ.update(env_updates)
+    try:
+        os.execvp(cmd_name, [cmd_name] + args)
+    except FileNotFoundError:
+        sys.stderr.write(f"[gkey] Command not found: {cmd_name}\n")
+        sys.exit(127)
 
 
-def print_fzf_list() -> None:
-    """Outputs one line per tool for fzf."""
-    for spec in TOOLS:
-        installed = is_tool_installed(spec) is not None
-        badge = "\033[32m✅已裝\033[0m" if installed else "\033[33m📦未裝\033[0m"
-        print(
-            f"{spec.id:<18}\t{badge}  \033[36m[{spec.category}]\033[0m \033[1m{spec.name:<28}\033[0m — {spec.summary}"
-        )
+def is_installed_label(spec: ToolSpec) -> str:
+    return "installed" if is_tool_installed(spec) else "not installed"
+
+
+def print_list(plain: bool = False) -> None:
+    """Human-readable list (default) or tab-separated rows for fzf (plain=True)."""
+    for i, spec in enumerate(TOOLS, 1):
+        label = is_installed_label(spec)
+        if plain:
+            print(f"{spec.id}\t{spec.id:<18} {label:<14} {spec.summary}")
+        else:
+            mark = _color("32", "installed    ") if label == "installed" else _color("33", "not installed")
+            print(f"{i:>2}. {spec.id:<18} {mark}  {spec.summary}")
 
 
 def print_preview(tool_id: str) -> None:
-    tool_id = tool_id.strip()
-    spec = TOOL_BY_ID.get(tool_id)
+    spec = TOOL_BY_ID.get(tool_id.strip())
     if not spec:
-        print(f"找不到工具: {tool_id}")
+        print(f"Unknown tool: {tool_id}")
         return
 
     installed_path = is_tool_installed(spec)
-    status_str = (
-        f"\033[1;32m✅ 已安裝 ({installed_path})\033[0m"
-        if installed_path
-        else "\033[1;33m📦 尚未安裝（按 Enter 選擇後將自動安裝！）\033[0m"
-    )
+    status = f"installed ({installed_path})" if installed_path else "not installed (installed automatically on first run)"
 
-    print(f"\033[1;36m━━━ {spec.name} ({spec.stars}) ━━━\033[0m")
-    print(f"\033[90m分類:\033[0m {spec.category}")
-    print(f"\033[90mGitHub:\033[0m {spec.repo}")
-    print(f"\033[90m狀態:\033[0m {status_str}")
-    print()
-    print("\033[1;33m💡 為什麼推薦：\033[0m")
-    print(f"  {spec.why_useful}")
-    print()
-    print("\033[1;32m🚀 gkey 零配置直接用法（不用記任何 API / Base URL 參數）：\033[0m")
+    print(_color("1;36", f"{spec.name}"))
+    print(f"{spec.summary}\n")
+    print(f"Category : {spec.category}")
+    print(f"Project  : {spec.repo}")
+    print(f"Status   : {status}\n")
+    print(spec.why_useful + "\n")
+    print(_color("1", "Examples"))
     for ex in spec.usage_examples:
-        print(f"  \033[1m{ex}\033[0m")
+        print(f"  {ex}")
     print()
-    print("\033[1;35m🪄 gkey 底層自動幫你適配了什麼：\033[0m")
-    print(f"  {spec.auto_adapt_note}")
-    print()
-    print("\033[90m📦 自動安裝指令：\033[0m")
-    print(f"  \033[90m{spec.install_cmd}\033[0m")
+    print(_color("1", "What gkey adapts for you"))
+    print(f"  {spec.auto_adapt_note}\n")
+    print(_color("1", "Install command"))
+    print(f"  {spec.install_cmd}")
 
 
 def main() -> None:
+    usage = (
+        "Usage: catalog.py list [--plain] | info <id> | install <id> | hint <id> | "
+        "poolsize <default> <explicit|-> <cmd> [args...] | adapt <port> <model> <cmd> [args...]"
+    )
     if len(sys.argv) < 2:
-        print("Usage: catalog.py [list|preview <id>|install <id>|info <id>|adapt <port> <model> <cmd> ...]")
+        print(usage)
         sys.exit(1)
 
     action = sys.argv[1]
     if action == "list":
-        print_fzf_list()
-    elif action == "preview":
+        print_list(plain="--plain" in sys.argv[2:])
+    elif action in ("info", "preview"):
         print_preview(sys.argv[2] if len(sys.argv) > 2 else "")
     elif action == "install":
-        spec = TOOL_BY_ID.get(sys.argv[2].strip())
+        spec = TOOL_BY_ID.get(sys.argv[2].strip()) if len(sys.argv) > 2 else None
         if not spec:
+            sys.stderr.write(f"[gkey] Unknown tool: {sys.argv[2] if len(sys.argv) > 2 else ''}\n")
             sys.exit(1)
         if not install_tool(spec):
             sys.exit(1)
     elif action == "hint":
-        spec = TOOL_BY_ID.get(sys.argv[2].strip())
+        spec = TOOL_BY_ID.get(sys.argv[2].strip()) if len(sys.argv) > 2 else None
         if spec:
             print(spec.default_prompt_hint)
+    elif action == "poolsize":
+        default = int(sys.argv[2])
+        explicit = None if sys.argv[3] == "-" else int(sys.argv[3])
+        cmd = sys.argv[4] if len(sys.argv) > 4 else ""
+        spec = TOOL_BY_ID.get(cmd)
+        detected = detect_concurrency(spec.id, sys.argv[5:]) if spec else None
+        print(compute_pool_size(default, explicit, detected))
     elif action == "adapt":
-        port = sys.argv[2]
-        model = sys.argv[3]
-        adapt_and_exec(port, model, sys.argv[4:])
+        adapt_and_exec(sys.argv[2], sys.argv[3], sys.argv[4:])
+    else:
+        print(usage)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
