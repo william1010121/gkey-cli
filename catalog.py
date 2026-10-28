@@ -13,6 +13,7 @@ from typing import List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import gkey_speed  # noqa: E402
 from gkey_common import (  # noqa: E402
     LOCAL_API_KEY,
     compute_pool_size,
@@ -64,6 +65,10 @@ class ToolSpec:
     usage_examples: List[str]
     default_prompt_hint: str
     auto_adapt_note: str
+    # Optional speed contract (see gkey_speed.py); None = not tuned / unsupported.
+    fast: Optional[dict] = None
+    batch_flag: Optional[str] = None
+    per_file: Optional[dict] = None
 
 
 TOOLS: list[ToolSpec] = [
@@ -319,6 +324,16 @@ TOOLS: list[ToolSpec] = [
     ),
 ]
 
+# Speed contract kept outside the ToolSpec entries (additive; a ToolSpec attribute of the same
+# name wins). Keys per tool id: fast={"flags": [...], "env": {...}, "pool": N, "aliases": {...}},
+# batch_flag="--flag", per_file={"value_flags": [...]}. See gkey_speed.py.
+SPEED: dict = {
+    "pdf2zh": {
+        # Upstream default is -t 4 (16 only with --ultrafast, which also changes the pipeline).
+        "fast": {"flags": ["-t", "16"], "pool": 16, "aliases": {"-t": ["--thread"]}},
+    },
+}
+
 TOOL_BY_ID: dict = {}
 for _t in TOOLS:
     TOOL_BY_ID[_t.id] = _t
@@ -413,6 +428,7 @@ _PDF2ZH_VALUE_FLAGS = {
     "-p", "--pages", "-li", "--lang-in", "-lo", "--lang-out", "-s", "--service", "-o", "--output",
     "-t", "--thread", "-c", "--vchar", "-f", "--formula", "--prompt", "--config", "--authorized",
 }
+SPEED["pdf2zh"]["per_file"] = {"value_flags": sorted(_PDF2ZH_VALUE_FLAGS)}
 
 
 def split_pdf2zh_layout(args: List[str]) -> "tuple[List[str], str]":
@@ -624,6 +640,43 @@ def adapt_args(spec: ToolSpec, args: List[str], port: str, model: str, env: dict
     return args
 
 
+def is_help_run(args: List[str]) -> bool:
+    return any(a in ("-h", "--help", "-v", "--version") for a in args)
+
+
+def apply_speed_options(spec: ToolSpec, args: List[str], env: dict) -> List[str]:
+    """--fast / --batch (from GKEY_FAST / GKEY_BATCH): inject per-tool flags the user did not pass."""
+    opts = gkey_speed.speed_options()
+    if opts["fast"]:
+        args, notes = gkey_speed.apply_fast(spec.id, args, gkey_speed.tool_config(spec, "fast", SPEED), env)
+        sys.stderr.write(f"[gkey] --fast ({spec.id}): {'; '.join(notes)}\n")
+    if opts["batch"]:
+        args, note = gkey_speed.apply_batch(args, opts["batch"], gkey_speed.tool_config(spec, "batch_flag", SPEED))
+        if note:
+            sys.stderr.write(f"[gkey] --batch ({spec.id}): {note}\n")
+    return args
+
+
+def maybe_run_parallel(spec: ToolSpec, binary: str, args: List[str], layout: Optional[str]) -> Optional[int]:
+    """--parallel-files N: one run per input file, up to N at once. None = not applicable."""
+    n = gkey_speed.speed_options()["parallel"]
+    if not n or n < 2:
+        return None
+    per_file = gkey_speed.tool_config(spec, "per_file", SPEED)
+    if not per_file:
+        sys.stderr.write(f"[gkey] --parallel-files ({spec.id}): this tool is not marked one-file-per-run; running normally\n")
+        return None
+    idx = gkey_speed.find_inputs(args, per_file.get("value_flags"))
+    if len(idx) < 2:
+        sys.stderr.write("[gkey] --parallel-files: fewer than 2 input files found; running normally\n")
+        return None
+    runs = gkey_speed.build_runs(args, idx)
+    labels = gkey_speed.unique_labels(args, idx)
+    post = (lambda a: pdf2zh_postprocess(binary, a, layout)) if spec.id == "pdf2zh" and layout else None
+    sys.stderr.write(f"[gkey] --parallel-files: {len(runs)} runs, up to {n} at once\n")
+    return gkey_speed.run_parallel(binary, runs, labels, n, post=post)
+
+
 def adapt_and_exec(port: str, model: str, argv: List[str]) -> None:
     """Install (if needed), adapt arguments/environment, then exec the target tool."""
     ensure_extended_path()
@@ -655,6 +708,7 @@ def adapt_and_exec(port: str, model: str, argv: List[str]) -> None:
         is_help = any(a in ("-h", "--help", "-v", "--version") for a in args)
         if not is_help:
             args = adapt_args(spec, args, port, model, env_updates)
+            args = apply_speed_options(spec, args, env_updates)
             if spec.id == "videocaptioner":
                 print(f"VideoCaptioner is installed at: {videocaptioner_dir()}")
                 print("Configure it with an OpenAI-compatible provider:")
@@ -664,6 +718,10 @@ def adapt_and_exec(port: str, model: str, argv: List[str]) -> None:
 
     layout = env_updates.pop("GKEY_PDF2ZH_LAYOUT", None)
     os.environ.update(env_updates)
+    if spec is not None and not is_help_run(argv[1:]):
+        rc = maybe_run_parallel(spec, cmd_name, args, layout)
+        if rc is not None:
+            sys.exit(rc)
     if spec is not None and spec.id == "pdf2zh" and layout:
         sys.exit(run_pdf2zh(cmd_name, args, layout))
     try:
@@ -709,6 +767,20 @@ def print_preview(tool_id: str) -> None:
     print()
     print(_color("1", "What gkey adapts for you"))
     print(f"  {spec.auto_adapt_note}\n")
+    print(_color("1", "Speed options (opt-in)"))
+    fast = gkey_speed.tool_config(spec, "fast", SPEED)
+    if fast:
+        bits = [" ".join(fast.get("flags") or [])] + [f"{k}={v}" for k, v in (fast.get("env") or {}).items()]
+        print(f"  --fast            adds: {' '.join(b for b in bits if b) or '(nothing)'}"
+              + (f"; proxy pool >= {fast['pool']}" if fast.get("pool") else "") + " (your own flags always win)")
+    else:
+        print("  --fast            no tuned profile yet (tool runs with its defaults)")
+    bf = gkey_speed.tool_config(spec, "batch_flag", SPEED)
+    print(f"  --batch <n>       " + (f"passes `{bf} <n>`" if bf else "not supported by this tool (ignored with a message)"))
+    pf = gkey_speed.tool_config(spec, "per_file", SPEED)
+    print("  --parallel-files <n>  " + ("runs several input files as concurrent runs through one proxy" if pf
+                                        else "not available (tool is not marked one-file-per-run)"))
+    print("  --cache / --retries <n>  proxy-side, work with every tool (see `gkey --help`)\n")
     print(_color("1", "Install command"))
     print(f"  {spec.install_cmd}")
 
@@ -744,7 +816,8 @@ def main() -> None:
         cmd = sys.argv[4] if len(sys.argv) > 4 else ""
         spec = TOOL_BY_ID.get(cmd)
         detected = detect_concurrency(spec.id, sys.argv[5:]) if spec else None
-        print(compute_pool_size(default, explicit, detected))
+        hint = gkey_speed.speed_pool_hint(spec, sys.argv[5:], SPEED) if spec else None
+        print(compute_pool_size(default, explicit, max(detected or 0, hint or 0) or None))
     elif action == "adapt":
         adapt_and_exec(sys.argv[2], sys.argv[3], sys.argv[4:])
     else:

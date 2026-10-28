@@ -108,13 +108,46 @@ only controls how many requests the tool sends. To avoid starving it, gkey reads
 restarting the proxy if the running one is smaller. The pool is capped at 16. Override it any time with `--pool-size N`.
 Automatic sizing only ever grows the pool; an explicit `--pool-size` is applied exactly.
 
+### Going faster (opt-in)
+
+None of these are on by default. All of them are **untested against real models** in this repo (tests use a fake
+backend and fake tools), so measure on your own workload; `gkey --bench` only measures proxy overhead.
+
+| Option | What it does |
+| --- | --- |
+| `--fast` | Applies a per-tool tuned profile. Flags you pass yourself always win. Today only `pdf2zh` has one (`-t 16`, proxy pool 16; upstream default is `-t 4`). Tools without a profile run unchanged and print a note. |
+| `--batch <n>` | Passes `<n>` to the tool's batch-size option when gkey knows it; otherwise ignored with a message. |
+| `--parallel-files <n>` | Several input files for a one-file-per-run tool (`pdf2zh` today): runs up to `n` at once through the same proxy, grows the pool to about `n x threads` (max 16), keeps each file's own output and exit code, and prefixes every log line with `[file.pdf]`. The overall exit code is the first non-zero one. If gkey cannot find 2+ input files it just runs normally. |
+| `--cache` | Proxy caches identical **non-streaming** requests (key = model, messages and every sampling parameter), in memory, LRU, size bounded (`GKEY_CACHE_MAX_ENTRIES`, `GKEY_CACHE_MAX_BYTES`). Errors and empty answers are never cached. Identical in-flight requests are coalesced into one backend call. |
+| `--cache-disk` | `--cache` plus persistence under `GKEY_HOME/cache` (bounded by `GKEY_CACHE_MAX_DISK_BYTES`, oldest evicted first). |
+| `--retries <n>` | Retries transient backend failures (dead worker, 429/5xx-looking errors) with exponential backoff (0.5 s x 2^k, max 8 s) and jitter. Never retries deadline timeouts, and never after output has started streaming. |
+
+`gkey --status` shows the cache hit rate, in-flight requests, the deepest queue seen and retried requests; `gkey --logs` has one `REQ` line
+per request (`queued=`, `cache=hit|miss|coalesced`) and a `QUEUE depth=` line whenever requests wait for a worker.
+Changing `--cache`/`--retries` restarts the proxy, like `--pool-size`; a proxy with the cache on is restarted when you run without `--cache`.
+
+Caveats, honestly: a cache hit returns the same text for a repeated prompt, which is wrong if you want a fresh sample; the backend ignores
+`temperature` anyway, but keep that in mind. The transient-error detection is a string heuristic, not a proven list. The agy workers are
+already pre-warmed and replenished after each recycle (every `--max-turns` turns, default 6); gkey did not change that, and whether a larger
+`GKEY_MAX_TURNS` or parallel warm-up (workers start one at a time today) helps on real models is unverified. Antigravity rate limits still apply.
+
+For tool authors: a `ToolSpec` (or the top-level `catalog.SPEED[tool_id]` dict) may carry `fast={"flags": [...], "env": {...}, "pool": N, "aliases": {...}}`,
+`batch_flag="--flag"` and `per_file={"value_flags": [...]}`; see `gkey_speed.py`. All are optional.
+
 ### Benchmarking the proxy
 
 ```bash
 gkey --bench                                  # 40 requests, 4 at a time
 gkey --bench --concurrency 8 --requests 200 --pool-size 8
 gkey --bench-real                             # opt-in: ONE tiny prompt per backend, prints time-to-first-token
+
+# Compare configurations side by side (each gets its own throwaway proxy; last column = req/s vs the first row)
+gkey --bench --concurrency 16 --delay-ms 100 --compare pool=4 --compare pool=16
+gkey --bench --dup-pct 50 --compare cache=off --compare cache=on
 ```
+
+`--compare` keys: `pool`, `cache` (on/off), `dup` (% repeated prompts), `conc`, `reqs`, `delay` (ms); unspecified keys come from the
+command line (`--pool-size`, `--cache`, `--dup-pct`, `--concurrency`, `--requests`, `--delay-ms`).
 
 `--bench` starts a throwaway proxy on a free port with `--fake-backend` (also `GKEY_FAKE_BACKEND=1`; delay via
 `GKEY_FAKE_DELAY_MS`, default 20 ms) that answers `/v1/chat/completions` with canned text, streaming and non-streaming.
@@ -137,6 +170,9 @@ and only when you pass it.
 | `GKEY_BACKEND`, `-b` | `auto` | `auto`, `sdk` or `agy` |
 | `GKEY_EFFORT`, `-e` | `low` | Reasoning effort for `agy` workers |
 | `GKEY_POOL_SIZE`, `--pool-size` | `4` | Warm workers / concurrent requests (1-16) |
+| `GKEY_CACHE`, `--cache` / `--cache-disk` | off | Opt-in response cache (see "Going faster") |
+| `GKEY_RETRIES`, `--retries` | `0` | Retries on transient backend failures |
+| `--fast`, `--batch`, `--parallel-files` | off | Opt-in per-tool speed options (see "Going faster") |
 | `GKEY_TIMEOUT` | `300` | Per-request deadline in seconds |
 | `GKEY_START_TIMEOUT` | `60` | Worker start deadline in seconds |
 | `GKEY_TARGET_LANG` | `Traditional Chinese` | Target language for tools that need one |

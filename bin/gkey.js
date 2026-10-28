@@ -38,7 +38,7 @@ function needsVenv(args) {
     const a = args[i];
     if (STDLIB_ONLY.has(a)) return false;
     if (a === "--bench" || a === "--bench-real") return true; // starts the Python proxy
-    if (a === "--concurrency" || a === "--requests") { i++; continue; }
+    if (["--concurrency", "--requests", "--batch", "--parallel-files", "--retries", "--dup-pct", "--delay-ms", "--compare"].includes(a)) { i++; continue; }
     if (["-m", "--model", "-b", "--backend", "-e", "--effort", "-p", "--port", "--pool-size"].includes(a)) { i++; continue; }
     if (a.startsWith("-")) continue;
     return true; // a tool name
