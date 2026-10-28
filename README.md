@@ -70,13 +70,13 @@ after each run. (It is an upstream pdf2zh bug in `pdfinterp.py`; gkey does not p
 | Tool | What it does | Example |
 | --- | --- | --- |
 | `pdf2zh` | Traditional Chinese (zh-TW) paper PDFs; keeps math and layout; Chinese pages then originals | `gkey pdf2zh paper.pdf` |
-| `babeldoc` | Next-gen PDF layout translation | `gkey babeldoc paper.pdf` |
-| `markitdown` | PDF/PPTX/DOCX/XLSX to Markdown | `gkey markitdown in.pdf -o out.md` |
-| `marker_single` | High-accuracy PDF to Markdown (tables, math) | `gkey marker_single paper.pdf` |
-| `gpt-subtrans` | Subtitle (.srt/.ass) translation | `gkey gpt-subtrans a.srt -o b.srt` |
-| `bbook_maker` | Bilingual EPUB | `gkey bbook_maker book.epub --test` |
-| `epub_to_audiobook` | EPUB to audiobook (macOS TTS) | `gkey epub_to_audiobook book.epub out/` |
-| `videocaptioner` | Re-segment and translate Whisper subtitles | `gkey videocaptioner` |
+| `babeldoc` | Next-gen PDF layout translation (`--qps`/`-q`, `--pool-max-workers` grow the pool; `--no-auto-extract-glossary` skips an extra LLM pass) | `gkey babeldoc paper.pdf` |
+| `markitdown` | PDF/PPTX/DOCX/XLSX to Markdown (local converter: the CLI makes no model calls, nothing to tune) | `gkey markitdown in.pdf -o out.md` |
+| `marker_single` | High-accuracy PDF to Markdown (tables, math); `--max_concurrency`, `--timeout` (needs image input and JSON-schema `response_format` from the backend) | `gkey marker_single paper.pdf` |
+| `gpt-subtrans` | Subtitle (.srt/.ass) translation; sequential, tune `--maxbatchsize` / `--scenethreshold` | `gkey gpt-subtrans a.srt -o b.srt` |
+| `bbook_maker` | Bilingual EPUB (PyPI `bbook_maker`); `--parallel-workers N` for chapter parallelism | `gkey bbook_maker book.epub --test` |
+| `epub_to_audiobook` | EPUB to audiobook (macOS TTS); `--worker_count N`, `--no_prompt` for unattended runs | `gkey epub_to_audiobook book.epub out/` |
+| `videocaptioner` | Re-segment and translate Whisper subtitles (runs the real CLI; `subtitle`/`process` accept `--thread-num`, `--batch-size`) | `gkey videocaptioner subtitle in.srt --translator llm --target-language zh-Hant` |
 | `fabric` | Prompt patterns for pipes | `cat a.md \| gkey fabric -p summarize` |
 | `mods` | LLM in UNIX pipes | `git diff \| gkey mods "review"` |
 | `ai-renamer` | Rename files by content | `gkey ai-renamer ~/Desktop/shots` |
@@ -104,7 +104,8 @@ Missing tools are installed on first use via `uv`, `npm`, `go`, `brew` or `cargo
 
 The proxy handles at most `GKEY_POOL_SIZE` (default 4) requests at once. A tool's own thread flag, such as `pdf2zh -t 8`,
 only controls how many requests the tool sends. To avoid starving it, gkey reads that flag
-(`pdf2zh -t/--thread`, `babeldoc --qps/--pool-max-workers`, `gpt-subtrans --maxthreads`) and grows the pool to match,
+(`pdf2zh -t/--thread`, `babeldoc -q/--qps/--pool-max-workers`, `marker_single --max_concurrency`, `bbook_maker --parallel-workers`,
+`epub_to_audiobook --worker_count`, `videocaptioner --thread-num`) and grows the pool to match,
 restarting the proxy if the running one is smaller. The pool is capped at 16. Override it any time with `--pool-size N`.
 Automatic sizing only ever grows the pool; an explicit `--pool-size` is applied exactly.
 

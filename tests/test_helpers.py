@@ -16,6 +16,13 @@ def test_detect_concurrency_forms():
     assert detect_concurrency("pdf2zh", ["a.pdf"]) is None
     assert detect_concurrency("pdf2zh", ["-t", "abc"]) is None
     assert detect_concurrency("markitdown", ["-t", "8"]) is None
+    assert detect_concurrency("babeldoc", ["a.pdf", "-q", "12"]) == 12
+    assert detect_concurrency("babeldoc", ["a.pdf", "--qps", "8", "--pool-max-workers", "24"]) == 24
+    assert detect_concurrency("marker_single", ["a.pdf", "--max_concurrency", "8"]) == 8
+    assert detect_concurrency("bbook_maker", ["b.epub", "--parallel-workers=4"]) == 4
+    assert detect_concurrency("epub_to_audiobook", ["b.epub", "o", "--worker_count", "4"]) == 4
+    assert detect_concurrency("videocaptioner", ["subtitle", "a.srt", "--thread-num", "8"]) == 8
+    assert detect_concurrency("gpt-subtrans", ["a.srt", "--maxthreads", "8"]) is None
 
 
 def test_pool_sizing():

@@ -64,6 +64,12 @@ class ToolSpec:
     usage_examples: List[str]
     default_prompt_hint: str
     auto_adapt_note: str
+    # Speed contract: `fast` = {"flags": [...], "env": {...}, "pool": N} injected (when the
+    # user did not pass them) by the fast profile; optional extra keys: "subcommands"
+    # (apply only to these first-arg subcommands) and "skip_if_any" (do not apply when any
+    # of these flags is present). `batch_flag` names the tool's batch-size knob.
+    fast: Optional[dict] = None
+    batch_flag: Optional[str] = None
 
 
 TOOLS: list[ToolSpec] = [
@@ -103,13 +109,22 @@ TOOLS: list[ToolSpec] = [
         repo="https://github.com/funstory-ai/BabelDOC",
         summary="Next-generation, high-precision bilingual PDF layout translation engine",
         why_useful="The successor engine to PDFMathTranslate, better at complex cross-column paragraphs and academic layouts.",
-        install_cmd="uv tool install BabelDOC",
+        # bitstring 5.x removed BitStream, which BabelDOC imports: a plain install crashes at import.
+        install_cmd='uv tool install --with "bitstring<5" BabelDOC',
         usage_examples=[
             "gkey babeldoc paper.pdf",
             "gkey babeldoc --files paper.pdf --lang-out zh-TW",
+            "gkey babeldoc paper.pdf --qps 8 --pool-max-workers 24   # gkey grows its worker pool to match (cap 16)",
+            "gkey babeldoc paper.pdf --no-auto-extract-glossary      # skip the extra glossary LLM pass (faster)",
         ],
         default_prompt_hint="Append a PDF path, e.g. paper.pdf",
-        auto_adapt_note="Rewrites a positional PDF to `--files` and injects `--openai --openai-model --openai-base-url --openai-api-key`.",
+        auto_adapt_note=(
+            "Rewrites a positional PDF to `--files` and injects `--openai --openai-model --openai-base-url --openai-api-key`. "
+            "Speed: default is `--qps 4`; `--qps`/`-q` and `--pool-max-workers` grow gkey's pool. "
+            "Fast profile: `--qps 8 --pool-max-workers 24 --no-auto-extract-glossary` (the glossary pass costs one extra LLM sweep over the whole document; "
+            "terminology consistency is slightly lower without it). Paragraph batching is built in and not configurable."
+        ),
+        fast={"flags": ["--qps", "8", "--pool-max-workers", "24", "--no-auto-extract-glossary"], "env": {}, "pool": 16},
     ),
     ToolSpec(
         id="markitdown",
@@ -118,8 +133,8 @@ TOOLS: list[ToolSpec] = [
         binary="markitdown",
         aliases=[],
         repo="https://github.com/microsoft/markitdown",
-        summary="Convert PDF, PPTX, DOCX, XLSX and images to clean Markdown",
-        why_useful="Turns messy office documents (PDF, PPTX, DOCX, XLSX, HTML, ZIP) into clean Markdown in one command.",
+        summary="Convert PDF, PPTX, DOCX, XLSX and images to clean Markdown (local, no model calls)",
+        why_useful="Turns messy office documents (PDF, PPTX, DOCX, XLSX, HTML, ZIP) into clean Markdown in one command. The CLI is a purely local converter: it never calls a model.",
         install_cmd='uv tool install "markitdown[all]"',
         usage_examples=[
             "gkey markitdown input.pdf -o output.md",
@@ -127,7 +142,11 @@ TOOLS: list[ToolSpec] = [
             "gkey markitdown report.docx",
         ],
         default_prompt_hint="Append an input file and optional output, e.g. input.pdf -o output.md",
-        auto_adapt_note="Sets `OPENAI_API_KEY` and `OPENAI_BASE_URL`.",
+        auto_adapt_note=(
+            "Nothing to adapt or tune: the markitdown CLI makes no LLM calls (llm_client is only available through its Python API), "
+            "reads no OPENAI_* variables and has no thread/batch flags, so gkey just runs it. Speed is local CPU/IO; "
+            "for many files run several processes yourself (one input per process), e.g. with `xargs -P`."
+        ),
     ),
     ToolSpec(
         id="marker_single",
@@ -142,9 +161,16 @@ TOOLS: list[ToolSpec] = [
         usage_examples=[
             "gkey marker_single paper.pdf",
             "gkey marker_single paper.pdf --output_dir ./md_out",
+            "gkey marker_single paper.pdf --max_concurrency 8 --timeout 120   # gkey grows its worker pool to match",
         ],
         default_prompt_hint="Append a PDF path, e.g. paper.pdf",
-        auto_adapt_note="Injects `--use_llm --llm_service marker.services.openai.OpenAIService --openai_api_key --openai_base_url --openai_model`.",
+        auto_adapt_note=(
+            "Injects `--use_llm --llm_service marker.services.openai.OpenAIService --openai_api_key --openai_base_url --openai_model`. "
+            "Marker defaults are `--max_concurrency 3 --timeout 30`; the fast profile uses `--max_concurrency 8 --timeout 120` "
+            "(30s is easily exceeded by image requests; after the retries a block silently loses its LLM result). "
+            "Marker sends images plus a JSON-schema `response_format`, so the backend must support both."
+        ),
+        fast={"flags": ["--max_concurrency", "8", "--timeout", "120"], "env": {}, "pool": 8},
     ),
     ToolSpec(
         id="gpt-subtrans",
@@ -159,9 +185,18 @@ TOOLS: list[ToolSpec] = [
         usage_examples=[
             "gkey gpt-subtrans movie.srt -o movie.zh.srt",
             "gkey gpt-subtrans movie.srt -l 'Japanese' -o movie.ja.srt",
+            "gkey gpt-subtrans movie.srt --maxbatchsize 100 --scenethreshold 120 -o movie.zh.srt",
         ],
         default_prompt_hint="Append a subtitle path, e.g. input.srt -o output.srt",
-        auto_adapt_note="Sets `OPENAI_API_KEY`, `OPENAI_BASE_URL` and `-l <GKEY_TARGET_LANG>` (default: Traditional Chinese).",
+        auto_adapt_note=(
+            "Passes `-b <gkey proxy>` (gpt-subtrans always sends its own --apibase default of api.openai.com, which would otherwise beat the "
+            "environment), `-k`, `-m <gkey model>` and `-l <GKEY_TARGET_LANG>` (default: Traditional Chinese) unless you give them. "
+            "The CLI translates batches sequentially (its MAX_THREADS only applies to the GUI), so the only speed levers are larger/fewer "
+            "batches: `--maxbatchsize` (default 100) and `--scenethreshold` (default 60s; batches never cross scenes). "
+            "Run several files in parallel as separate processes."
+        ),
+        fast={"flags": ["--maxbatchsize", "100", "--scenethreshold", "120"], "env": {}, "pool": 4},
+        batch_flag="--maxbatchsize",
     ),
     ToolSpec(
         id="bbook_maker",
@@ -172,14 +207,22 @@ TOOLS: list[ToolSpec] = [
         repo="https://github.com/yihong0618/bilingual_book_maker",
         summary="Turn a foreign-language .epub into a bilingual .epub",
         why_useful="Keeps chapter structure and illustrations and produces paragraph-aligned bilingual books. `--test` translates only the first few paragraphs as a preview.",
-        install_cmd="uv tool install bilingual_book_maker",
+        # the PyPI project is `bbook_maker` (there is no `bilingual_book_maker` package)
+        install_cmd="uv tool install bbook_maker",
         usage_examples=[
             "gkey bbook_maker book.epub",
             "gkey bbook_maker book.epub --test              # preview the first few paragraphs",
             "gkey bbook_maker --book_name book.epub --language 'Japanese'",
+            "gkey bbook_maker book.epub --parallel-workers 4   # translate 4 chapters at once (gkey grows its worker pool to match)",
         ],
         default_prompt_hint="Append an e-book path, e.g. book.epub --test",
-        auto_adapt_note="Turns `book.epub` into `--book_name book.epub` and adds `--openai_key`, `--api_base`, `--language <GKEY_TARGET_LANG>`.",
+        auto_adapt_note=(
+            "Turns `book.epub` into `--book_name book.epub` and adds `--key`, `--api_base`, `-m <gkey model>`, "
+            "`--language <GKEY_TARGET_LANG>` unless you pass them. Fast profile: `--parallel-workers 4` (chapter-level parallelism; "
+            "refused with `--use_context session`, and it stops the run when combined with `--resume` and `--accumulated_num` above 1, "
+            "so the fast profile skips itself if `--resume` or `--use_context` is present)."
+        ),
+        fast={"flags": ["--parallel-workers", "4"], "env": {}, "pool": 4, "skip_if_any": ["--resume", "--use_context"]},
     ),
     ToolSpec(
         id="epub_to_audiobook",
@@ -193,9 +236,16 @@ TOOLS: list[ToolSpec] = [
         install_cmd='uv tool install "git+https://github.com/p0n1/epub_to_audiobook.git"',
         usage_examples=[
             "gkey epub_to_audiobook book.epub ./audiobook_out",
+            "gkey epub_to_audiobook book.epub ./audiobook_out --worker_count 4 --no_prompt",
         ],
         default_prompt_hint="Append <input.epub> <output-dir>, e.g. book.epub ./out",
-        auto_adapt_note="Appends `--tts openai`; speech is served by gkey's built-in /v1/audio/speech (macOS only).",
+        auto_adapt_note=(
+            "Appends `--tts openai`; speech is served by gkey's built-in /v1/audio/speech (macOS only). "
+            "`--worker_count N` converts N chapters in parallel processes (default 1; fast profile uses 4). "
+            "Without `--no_prompt` the tool stops at a `Do you want to continue? (y/n)` question after its cost estimate, "
+            "so pass `--no_prompt` for unattended runs."
+        ),
+        fast={"flags": ["--worker_count", "4"], "env": {}, "pool": 4},
     ),
     ToolSpec(
         id="videocaptioner",
@@ -206,12 +256,22 @@ TOOLS: list[ToolSpec] = [
         repo="https://github.com/WEIFENG2333/VideoCaptioner",
         summary="LLM-powered sentence splitting and bilingual subtitles for Whisper output",
         why_useful="Re-segments choppy speech-recognition subtitles into natural single-line bilingual subtitles.",
-        install_cmd='mkdir -p "${GKEY_HOME:-$HOME/.gkey}/tools" && (test -d "${GKEY_HOME:-$HOME/.gkey}/tools/VideoCaptioner" || git clone --depth 1 https://github.com/WEIFENG2333/VideoCaptioner.git "${GKEY_HOME:-$HOME/.gkey}/tools/VideoCaptioner")',
+        # PyPI package videocaptioner needs Python < 3.13; it also imports httpx without declaring it
+        install_cmd="uv tool install --python 3.12 --with httpx videocaptioner",
         usage_examples=[
-            "gkey videocaptioner",
+            "gkey videocaptioner subtitle in.srt --translator llm --target-language zh-Hant -o out.srt",
+            "gkey videocaptioner subtitle in.srt --thread-num 8 --batch-size 30   # gkey grows its worker pool to match",
+            "gkey videocaptioner --help",
         ],
-        default_prompt_hint="Press Enter to set up VideoCaptioner",
-        auto_adapt_note="Clones the repo into ~/.gkey/tools and prints the OPENAI_BASE_URL / OPENAI_API_KEY to use (key masked).",
+        default_prompt_hint="Append a subcommand, e.g. subtitle in.srt --translator llm --target-language zh-Hant",
+        auto_adapt_note=(
+            "Runs the real `videocaptioner` CLI with OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_MODEL pointing at gkey "
+            "(videocaptioner reads these itself). Translation is off unless you pass --translator or --target-language "
+            "(use `--translator llm` to translate through gkey; the default translator is Bing). "
+            "Fast profile for the `subtitle` and `process` subcommands only: `--thread-num 8 --batch-size 30` (defaults 4 and 20). "
+            "With no subcommand the tool opens its GUI."
+        ),
+        fast={"flags": ["--thread-num", "8", "--batch-size", "30"], "env": {}, "pool": 8, "subcommands": ["subtitle", "process"]},
     ),
     ToolSpec(
         id="fabric",
@@ -327,15 +387,8 @@ for _t in TOOLS:
         TOOL_BY_ID[_alias] = _t
 
 
-def videocaptioner_dir() -> pathlib.Path:
-    return gkey_home() / "tools" / "VideoCaptioner"
-
-
 def is_tool_installed(spec: ToolSpec) -> Optional[str]:
     ensure_extended_path()
-    if spec.id == "videocaptioner":
-        vc_dir = videocaptioner_dir()
-        return str(vc_dir) if vc_dir.is_dir() else None
     path = shutil.which(spec.binary)
     if path:
         return path
@@ -524,6 +577,17 @@ def run_pdf2zh(binary: str, args: List[str], layout: str) -> int:
     return rc
 
 
+def _has_flag(args: List[str], *names: str) -> bool:
+    """True when any of `names` is present as `--x v`, `--x=v` or (single-dash) `-xv`."""
+    for a in args:
+        for n in names:
+            if a == n or a.startswith(n + "="):
+                return True
+            if not n.startswith("--") and a.startswith(n) and len(a) > len(n) and not a.startswith("--"):
+                return True
+    return False
+
+
 def adapt_args(spec: ToolSpec, args: List[str], port: str, model: str, env: dict) -> List[str]:
     """Return the adapted argv tail and mutate `env` with the variables the tool needs.
 
@@ -569,18 +633,25 @@ def adapt_args(spec: ToolSpec, args: List[str], port: str, model: str, env: dict
             args.extend(["--openai_model", model])
 
     elif spec.id == "gpt-subtrans":
-        if not any(a in ("-l", "--target_language") for a in args):
+        # gpt-subtrans always passes its own --apibase default (api.openai.com), which beats the env
+        if not _has_flag(args, "-b", "--apibase"):
+            args.extend(["-b", base_url])
+        if not _has_flag(args, "-k", "--apikey"):
+            args.extend(["-k", api_key])
+        if not _has_flag(args, "-m", "--model"):
+            args.extend(["-m", model])
+        if not _has_flag(args, "-l", "--target-language"):
             args.extend(["-l", lang])
 
     elif spec.id == "bbook_maker":
         if args and not args[0].startswith("-") and "--book_name" not in args:
             args = ["--book_name", args[0]] + args[1:]
-        if "--openai_key" not in args:
-            args.extend(["--openai_key", api_key])
-        if "--api_base" not in args:
+        if not _has_flag(args, "--key", "--api_key", "--openai_key"):
+            args.extend(["--key", api_key])
+        if not _has_flag(args, "--api_base"):
             args.extend(["--api_base", base_url])
-        if "--model" not in args:
-            args.extend(["--model", "gpt-4o-mini"])
+        if not _has_flag(args, "-m", "--model"):
+            args.extend(["-m", model])
         if "--language" not in args:
             args.extend(["--language", lang])
 
@@ -655,12 +726,6 @@ def adapt_and_exec(port: str, model: str, argv: List[str]) -> None:
         is_help = any(a in ("-h", "--help", "-v", "--version") for a in args)
         if not is_help:
             args = adapt_args(spec, args, port, model, env_updates)
-            if spec.id == "videocaptioner":
-                print(f"VideoCaptioner is installed at: {videocaptioner_dir()}")
-                print("Configure it with an OpenAI-compatible provider:")
-                print(f"  OPENAI_BASE_URL={env_updates['OPENAI_BASE_URL']}")
-                print(f"  OPENAI_API_KEY={mask_secret(env_updates['OPENAI_API_KEY'])}")
-                sys.exit(0)
 
     layout = env_updates.pop("GKEY_PDF2ZH_LAYOUT", None)
     os.environ.update(env_updates)
