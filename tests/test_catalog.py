@@ -90,17 +90,65 @@ def test_real_openai_key_is_never_inherited(monkeypatch, capfd):
     assert real not in " ".join(seen["argv"])
 
 
-def test_videocaptioner_output_never_prints_real_key(monkeypatch, capfd, tmp_path):
+def test_videocaptioner_runs_real_cli_with_env_and_never_leaks_key(monkeypatch):
     real = "sk-proj-REALKEYREALKEYREALKEY1234"
     monkeypatch.setenv("OPENAI_API_KEY", real)
-    monkeypatch.setenv("GKEY_HOME", str(tmp_path))
+    seen = {}
+    monkeypatch.setattr(
+        catalog.os, "execvp",
+        lambda cmd, argv: seen.update(cmd=cmd, argv=argv, env=dict(catalog.os.environ)),
+    )
     monkeypatch.setattr(catalog, "install_tool", lambda spec: True)
-    try:
-        catalog.adapt_and_exec(PORT, MODEL, ["videocaptioner"])
-    except SystemExit:
-        pass
-    out = capfd.readouterr()
-    assert real not in out.out + out.err
+    catalog.adapt_and_exec(PORT, MODEL, ["videocaptioner", "subtitle", "a.srt", "--thread-num", "8"])
+    assert seen["cmd"] == "videocaptioner"
+    assert seen["argv"][1:] == ["subtitle", "a.srt", "--thread-num", "8"]
+    assert seen["env"]["OPENAI_API_KEY"] == LOCAL_API_KEY
+    assert seen["env"]["OPENAI_BASE_URL"] == f"http://127.0.0.1:{PORT}/v1"
+    assert seen["env"]["OPENAI_MODEL"] == MODEL
+    assert real not in " ".join(seen["argv"])
+
+
+def test_videocaptioner_install_installs_the_cli():
+    cmd = catalog.TOOL_BY_ID["videocaptioner"].install_cmd
+    assert "videocaptioner" in cmd and "git clone" not in cmd and "--with httpx" in cmd
+
+
+def test_gpt_subtrans_points_at_proxy_and_respects_user_flags():
+    args, _ = adapt("gpt-subtrans", ["a.srt", "-o", "b.srt"])
+    assert args[args.index("-b") + 1] == f"http://127.0.0.1:{PORT}/v1"
+    assert args[args.index("-m") + 1] == MODEL
+    assert args[args.index("-l") + 1] == "Traditional Chinese"
+    args, _ = adapt("gpt-subtrans", ["a.srt", "--target-language", "Japanese", "--apibase=http://x/v1", "-m", "m"])
+    assert "-l" not in args and "-b" not in args and args.count("-m") == 1
+    assert catalog.TOOL_BY_ID["gpt-subtrans"].batch_flag == "--maxbatchsize"
+
+
+def test_bbook_maker_uses_current_flags_and_gkey_model():
+    args, _ = adapt("bbook_maker", ["book.epub"])
+    assert args[args.index("--key") + 1] == LOCAL_API_KEY
+    assert args[args.index("--api_base") + 1] == f"http://127.0.0.1:{PORT}/v1"
+    assert args[args.index("-m") + 1] == MODEL
+    assert "--openai_key" not in args and "gpt-4o-mini" not in args
+    args, _ = adapt("bbook_maker", ["book.epub", "--model", "x", "--openai_key", "k"])
+    assert "-m" not in args and "--key" not in args
+
+
+def test_babeldoc_install_pins_bitstring():
+    assert 'bitstring<5' in catalog.TOOL_BY_ID["babeldoc"].install_cmd
+
+
+def test_bbook_maker_install_uses_pypi_name():
+    assert catalog.TOOL_BY_ID["bbook_maker"].install_cmd == "uv tool install bbook_maker"
+
+
+def test_fast_profiles_declared():
+    by = catalog.TOOL_BY_ID
+    assert by["babeldoc"].fast["flags"] == ["--qps", "8", "--pool-max-workers", "24", "--no-auto-extract-glossary"]
+    assert by["marker_single"].fast["flags"] == ["--max_concurrency", "8", "--timeout", "120"]
+    assert by["bbook_maker"].fast["flags"] == ["--parallel-workers", "4"]
+    assert by["epub_to_audiobook"].fast["flags"] == ["--worker_count", "4"]
+    assert by["videocaptioner"].fast["subcommands"] == ["subtitle", "process"]
+    assert by["markitdown"].fast is None
 
 
 def test_help_flags_pass_through(monkeypatch):

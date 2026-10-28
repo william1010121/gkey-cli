@@ -50,8 +50,12 @@ def redact_text(text: str) -> str:
 # these is present we size the proxy pool to match so the tool is not starved.
 CONCURRENCY_FLAGS = {
     "pdf2zh": ("-t", "--thread"),
-    "babeldoc": ("--qps", "--pool-max-workers"),
-    "gpt-subtrans": ("--maxthreads",),
+    "babeldoc": ("-q", "--qps", "--pool-max-workers"),
+    # gpt-subtrans has no thread flag (its MAX_THREADS is GUI-only), so no entry
+    "marker_single": ("--max_concurrency",),
+    "bbook_maker": ("--parallel-workers",),
+    "epub_to_audiobook": ("--worker_count",),
+    "videocaptioner": ("--thread-num",),
 }
 
 
