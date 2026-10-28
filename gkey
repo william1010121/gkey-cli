@@ -69,7 +69,7 @@ Examples:
   gkey pdf2zh-next paper.pdf --layout dual
                                         the tool's own outputs only (no merged PDF); --lang-out ja for another language
   gkey pdf2zh-next paper.pdf --qps 8    8 requests/s and workers; gkey grows its worker pool to match
-                                        (`gkey pdf2zh ...` still works and runs pdf2zh-next)
+                                        (gkey pdf2zh ... still works and runs pdf2zh-next)
   gkey --fast pdf2zh-next paper.pdf     Tuned profile (--qps 16, --pool-max-workers 16, 16-worker proxy pool)
   gkey --parallel-files 3 pdf2zh-next a.pdf b.pdf c.pdf   Three papers at once, prefixed logs
   gkey markitdown input.pdf -o out.md   Any document to Markdown

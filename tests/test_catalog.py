@@ -360,3 +360,13 @@ def test_fast_profiles_declared_for_cli_tools():
     assert t["gptcommit"].fast["env"]["GPTCOMMIT__OPENAI__RETRIES"] == "1"
     assert t["lobe-i18n"].fast["env"]["GKEY_LOBE_CONCURRENCY"] == "8"
     assert all(t[i].fast["pool"] <= 16 for i in ("fabric", "mods", "ai-renamer", "oco", "gptcommit", "lobe-i18n"))
+
+
+def test_gkey_help_has_no_shell_expansion_in_heredoc():
+    """The help text is an unquoted bash heredoc: a backtick or $( would run a command when printing it."""
+    import pathlib
+    text = pathlib.Path(__file__).resolve().parent.parent.joinpath("gkey").read_text()
+    start = text.index("cat <<EOF")
+    end = text.index("\nEOF", start)
+    body = text[start:end]
+    assert "`" not in body and "$(" not in body
