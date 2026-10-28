@@ -193,9 +193,17 @@ class SDKBackend:
 
     def __init__(self, default_model: str, concurrency: int = 4):
         self.default_model = default_model
-        self.semaphore = asyncio.Semaphore(concurrency)
+        self._concurrency = concurrency
+        self._semaphore: Optional[asyncio.Semaphore] = None
         self.workspace_dir = workspace_root() / "sdk"
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def semaphore(self) -> asyncio.Semaphore:
+        # Created lazily: on Python < 3.10 asyncio primitives bind to the loop at construction.
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self._concurrency)
+        return self._semaphore
 
     def resolve_model(self, requested: str | None) -> str:
         if not requested or requested not in AGY_MODELS:
@@ -329,12 +337,31 @@ class AgyCLIBackend:
         self.max_turns_per_worker = max_turns_per_worker
         self.workspace_dir = workspace_root() / "agy"
         self._setup_isolated_workspace()
-        self.pool: asyncio.Queue[AgyStreamWorker] = asyncio.Queue()
-        self.semaphore = asyncio.Semaphore(pool_size)
-        self._spawn_lock = asyncio.Lock()
+        self._pool: Optional[asyncio.Queue] = None
+        self._semaphore: Optional[asyncio.Semaphore] = None
+        self._lock: Optional[asyncio.Lock] = None
         self._bg_tasks: set[asyncio.Task[Any]] = set()
         self._closed = False
         self.last_warm_error: Optional[str] = None
+
+    # asyncio primitives are created lazily (inside the running loop); see SDKBackend.semaphore.
+    @property
+    def pool(self) -> "asyncio.Queue[AgyStreamWorker]":
+        if self._pool is None:
+            self._pool = asyncio.Queue()
+        return self._pool
+
+    @property
+    def semaphore(self) -> asyncio.Semaphore:
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self.pool_size)
+        return self._semaphore
+
+    @property
+    def _spawn_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     def _setup_isolated_workspace(self) -> None:
         agents_dir = self.workspace_dir / ".agents" / "agents"
