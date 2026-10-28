@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""pdf2zh post-processing for gkey.
+"""pdf2zh-next post-processing for gkey.
 
 Two jobs, both done on pdf2zh's *outputs* (nothing inside pdf2zh is patched):
 
-1. ``sanitize_content``: pdf2zh (<= 1.9.x, pdfinterp.py) writes the inverse CTM into form
+1. ``sanitize_content``: pdf2zh 1.9.x (pdfinterp.py; defensive for pdf2zh-next, whose BabelDOC writer may not need it) writes the inverse CTM into form
    XObject streams with Python's ``repr(float)``, which can give scientific notation such as
    ``1.8968225213473183e-16``. PDF content streams do not allow exponents, so MuPDF prints
    ``syntax error: unknown keyword: '1.8968225213473183e'`` and drops that operator. We
    rewrite those numbers in fixed notation.
 2. ``merge``: build ONE PDF with all translated pages first, then all original pages.
 
-The PDF work needs PyMuPDF, which lives in pdf2zh's own tool environment, so the gkey
+The PDF work needs PyMuPDF, which lives in pdf2zh-next's own tool environment, so the gkey
 launcher runs this file with that interpreter:  python pdf_post.py zh-then-en MONO ORIG OUT [PAGES]  |  python pdf_post.py fix FILE...
 """
 
@@ -37,7 +37,7 @@ def sanitize_content(data: bytes) -> bytes:
 
 
 def parse_pages(spec: Optional[str], total: int) -> Optional[List[int]]:
-    """Parse pdf2zh's -p value ("1-5,8", "3-") into 0-based indexes; None if unusable."""
+    """Parse the --pages value ("1-5,8", "3-") into 0-based indexes; None if unusable."""
     if not spec:
         return None
     out: List[int] = []
@@ -55,7 +55,7 @@ def parse_pages(spec: Optional[str], total: int) -> Optional[List[int]]:
                 out.append(int(part) - 1)
     except ValueError:
         return None
-    out = [p for p in out if 0 <= p < total]
+    out = sorted({p for p in out if 0 <= p < total})
     return out or None
 
 
@@ -83,7 +83,7 @@ def sanitize_document(doc) -> int:
 
 def merge_zh_then_en(mono_path: str, orig_path: str, out_path: str, pages: Optional[str] = None) -> str:
     """Write OUT = [all pages of MONO] + [matching pages of ORIG]. Returns a status line."""
-    import fitz  # PyMuPDF (pdf2zh dependency)
+    import fitz  # PyMuPDF (pdf2zh-next dependency)
 
     mono = fitz.open(mono_path)
     orig = fitz.open(orig_path)

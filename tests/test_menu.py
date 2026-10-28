@@ -12,7 +12,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 def test_filter_and_resolve():
     ids = [t.id for t in menu.filter_tools("pdf", catalog.TOOLS)]
-    assert "pdf2zh" in ids and "oco" not in ids
+    assert "pdf2zh-next" in ids and "oco" not in ids
     assert [t.id for t in menu.filter_tools("", catalog.TOOLS)] == [t.id for t in catalog.TOOLS]
     assert menu.resolve_choice("1", catalog.TOOLS) == catalog.TOOLS[0].id
     assert menu.resolve_choice("999", catalog.TOOLS) is None

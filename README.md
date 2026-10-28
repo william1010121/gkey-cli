@@ -13,7 +13,7 @@ Most great LLM command-line tools want an OpenAI key and a handful of `--base-ur
 then installs the tool you ask for and fills in every flag and environment variable for it.
 
 ```text
-$ gkey pdf2zh paper.pdf        # that's the whole command
+$ gkey pdf2zh-next paper.pdf   # that's the whole command
 ```
 
 ## Quickstart (30 seconds)
@@ -22,7 +22,7 @@ Prerequisites: Node 18+, Python 3.9+, and the Antigravity CLI (`agy`) logged in.
 
 ```bash
 npx gkey-cli                       # pick a tool from the menu
-npx gkey-cli pdf2zh paper.pdf      # or run one directly
+npx gkey-cli pdf2zh-next paper.pdf # or run one directly
 npm i -g gkey-cli                  # optional: then just `gkey ...`
 ```
 
@@ -35,7 +35,7 @@ in a pipe or CI it prints a plain numbered list). Picking a tool does not dump d
 editable prompt with the command prefilled. Add your file and press Enter. Tab completes paths.
 
 ```text
-$ gkey pdf2zh paper.pdf -p 1-5█
+$ gkey pdf2zh-next paper.pdf --pages 1-5█
 ```
 
 Long descriptions live behind `gkey info <tool>`.
@@ -43,33 +43,39 @@ Long descriptions live behind `gkey info <tool>`.
 ### Demo: translating a paper
 
 ```text
-$ gkey pdf2zh paper.pdf -t 8
-[gkey] pdf2zh is not installed; installing it now...        # first time only
-[gkey] Proxy ready at http://127.0.0.1:18432/v1             # pool grown to 8 workers to match -t 8
+$ gkey pdf2zh-next paper.pdf
+[gkey] PDFMathTranslate-next (pdf2zh_next) is not installed; installing it now...   # first time only
+[gkey] Proxy ready at http://127.0.0.1:18432/v1             # pool grown to 16 workers to match --qps 16
 ...
-paper-mono.pdf              # Traditional Chinese pages only
-paper-dual.pdf              # bilingual, side by side
-paper-zh-TW-then-en.pdf     # ONE file: all Chinese pages first, then all original pages
+paper.zh-TW.mono.pdf        # Traditional Chinese pages only
+paper.zh-TW.dual.pdf        # bilingual, side by side
+paper.zh-TW-then-en.pdf     # ONE file: all Chinese pages first, then all original pages
 ```
 
-gkey added `-s openai` and `-lo zh-TW` (Traditional Chinese is the default; pass `-lo ja` etc. to change it), pointed the tool at `http://127.0.0.1:18432/v1`, and supplied a placeholder key. You typed none of it.
+gkey added `--openai --openai-model ... --openai-base-url ... --openai-api-key ...` (pointing at `http://127.0.0.1:18432/v1`
+with a placeholder key), `--lang-out zh-TW` (Traditional Chinese is the default; pass `--lang-out ja` etc. to change it) and
+`--qps 16 --pool-max-workers 16`. You typed none of it. Your own flags always win.
 
-### pdf2zh output layout
+### pdf2zh-next output layout
 
-`gkey pdf2zh paper.pdf` translates to Traditional Chinese (zh-TW) and, by default (`--layout zh-then-en`), also writes
-`<name>-zh-TW-then-en.pdf`: the whole translated document followed by the whole original, not interleaved
-(a 16-page paper gives 32 pages). Use `--layout dual` to skip that merged file; `-mono.pdf` and `-dual.pdf` are always kept.
-With `-p 1-5` only the selected original pages are appended. The merge uses PyMuPDF from pdf2zh's own environment.
+`gkey pdf2zh-next paper.pdf` translates to Traditional Chinese (zh-TW) and, by default (`--layout zh-then-en`), also writes
+`<name>.zh-TW-then-en.pdf`: the whole translated document followed by the whole original, not interleaved
+(a 16-page paper gives 32 pages). Use `--layout dual` to skip that merged file; the tool's own `.mono.pdf` and `.dual.pdf` are always kept.
+With `--pages 1-5` gkey adds `--only-include-translated-page` so only the selected original pages are appended.
+The merge uses PyMuPDF from pdf2zh-next's own environment.
 
-pdf2zh (1.9.x) writes some page numbers with exponents (`1.89e-16`), which makes MuPDF-based viewers print
-`unknown keyword: '1.89e'` and drop an operator. gkey rewrites those numbers in `-mono.pdf`, `-dual.pdf` and the merged file
-after each run. (It is an upstream pdf2zh bug in `pdfinterp.py`; gkey does not patch pdf2zh itself.)
+`pdf2zh` is kept as an alias: `gkey pdf2zh paper.pdf` prints a one-line notice and runs pdf2zh-next.
+Old pdf2zh flags (`-s`, `-lo`, `-t`, `-p`) do not exist in pdf2zh-next; use `--lang-out`, `--qps`, `--pages`.
+The first install uses `uv tool install --force --with "bitstring<5" pdf2zh-next`: `--force` because pdf2zh-next also ships a
+`pdf2zh` executable that would clash with the old one, and `bitstring<5` because bitstring 5 breaks BabelDOC.
+On first run pdf2zh-next downloads its layout model and fonts.
+gkey still rewrites numbers with exponents (the old pdf2zh `unknown keyword: '1.89e'` MuPDF bug) in the outputs; it is a no-op when none are found.
 
 ## Supported tools
 
 | Tool | What it does | Example |
 | --- | --- | --- |
-| `pdf2zh` | Traditional Chinese (zh-TW) paper PDFs; keeps math and layout; Chinese pages then originals | `gkey pdf2zh paper.pdf` |
+| `pdf2zh-next` (alias `pdf2zh`) | Traditional Chinese (zh-TW) paper PDFs; keeps math and layout; Chinese pages then originals | `gkey pdf2zh-next paper.pdf` |
 | `babeldoc` | Next-gen PDF layout translation | `gkey babeldoc paper.pdf` |
 | `markitdown` | PDF/PPTX/DOCX/XLSX to Markdown | `gkey markitdown in.pdf -o out.md` |
 | `marker_single` | High-accuracy PDF to Markdown (tables, math) | `gkey marker_single paper.pdf` |
@@ -102,9 +108,9 @@ Missing tools are installed on first use via `uv`, `npm`, `go`, `brew` or `cargo
 
 ### Worker pool and `-t`
 
-The proxy handles at most `GKEY_POOL_SIZE` (default 4) requests at once. A tool's own thread flag, such as `pdf2zh -t 8`,
+The proxy handles at most `GKEY_POOL_SIZE` (default 4) requests at once. A tool's own thread flag, such as `pdf2zh-next --qps 8`,
 only controls how many requests the tool sends. To avoid starving it, gkey reads that flag
-(`pdf2zh -t/--thread`, `babeldoc --qps/--pool-max-workers`, `gpt-subtrans --maxthreads`) and grows the pool to match,
+(`pdf2zh-next --qps/--pool-max-workers`, `babeldoc --qps/--pool-max-workers`, `gpt-subtrans --maxthreads`) and grows the pool to match,
 restarting the proxy if the running one is smaller. The pool is capped at 16. Override it any time with `--pool-size N`.
 Automatic sizing only ever grows the pool; an explicit `--pool-size` is applied exactly.
 

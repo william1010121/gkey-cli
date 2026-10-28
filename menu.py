@@ -67,7 +67,7 @@ def numbered_fallback(tools: Sequence[catalog.ToolSpec], out=None) -> None:
     for i, t in enumerate(tools, 1):
         status = "installed" if catalog.is_tool_installed(t) else "not installed"
         out.write(f"{i:>3}. {t.id:<18} {status:<14} {t.summary}\n")
-    out.write("\nExample: gkey pdf2zh paper.pdf\n")
+    out.write("\nExample: gkey pdf2zh-next paper.pdf\n")
 
 
 def pick_with_fzf(tools: Sequence[catalog.ToolSpec]) -> Optional[str]:
