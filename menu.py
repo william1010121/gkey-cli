@@ -219,7 +219,6 @@ def _setup_readline(initial: str):
         readline.parse_and_bind("bind ^I rl_complete")  # macOS system Python
     else:
         readline.parse_and_bind("tab: complete")
-    readline.set_startup_hook(lambda: readline.insert_text(initial))
     return readline
 
 
@@ -236,13 +235,12 @@ def prompt_command(tool_id: str) -> Optional[List[str]]:
     initial = f"gkey {tool_id} "
     rl = _setup_readline(initial)
     try:
-        line = input("$ ") if rl is not None else initial + input(f"$ {initial}")
+        # The command stays on screen as the prompt itself (readline's prefill is
+        # unreliable on macOS libedit); the user just appends the arguments.
+        line = initial + input(f"$ {initial}")
     except (EOFError, KeyboardInterrupt):
         sys.stdout.write("\n")
         return None
-    finally:
-        if rl is not None:
-            rl.set_startup_hook(None)
     try:
         return parse_command_line(line)
     except ValueError as e:
