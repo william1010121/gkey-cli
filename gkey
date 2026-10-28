@@ -64,12 +64,14 @@ Usage:
   gkey info <tool>                      Show details, examples and what gkey adapts for a tool
 
 Examples:
-  gkey pdf2zh paper.pdf                 Translate a paper to Traditional Chinese (keeps math and layout);
-                                        also writes <name>-zh-TW-then-en.pdf (Chinese pages, then originals)
-  gkey pdf2zh paper.pdf --layout dual   pdf2zh's own outputs only (no merged PDF); -lo ja for another language
-  gkey pdf2zh paper.pdf -t 8            8 threads; gkey grows its worker pool to match
-  gkey --fast pdf2zh paper.pdf          Tuned profile (-t 16, 16 workers)
-  gkey --parallel-files 3 pdf2zh a.pdf b.pdf c.pdf   Three papers at once, prefixed logs
+  gkey pdf2zh-next paper.pdf            Translate a paper to Traditional Chinese (keeps math and layout);
+                                        also writes <name>.zh-TW-then-en.pdf (Chinese pages, then originals)
+  gkey pdf2zh-next paper.pdf --layout dual
+                                        the tool's own outputs only (no merged PDF); --lang-out ja for another language
+  gkey pdf2zh-next paper.pdf --qps 8    8 requests/s and workers; gkey grows its worker pool to match
+                                        (`gkey pdf2zh ...` still works and runs pdf2zh-next)
+  gkey --fast pdf2zh-next paper.pdf     Tuned profile (--qps 16, --pool-max-workers 16, 16-worker proxy pool)
+  gkey --parallel-files 3 pdf2zh-next a.pdf b.pdf c.pdf   Three papers at once, prefixed logs
   gkey markitdown input.pdf -o out.md   Any document to Markdown
   gkey gpt-subtrans movie.srt -o zh.srt Translate subtitles
   git diff | gkey mods "review this"    LLM in a UNIX pipe
@@ -83,10 +85,10 @@ Options (before <tool>):
   -e, --effort <level>      low | medium | high (default: ${EFFORT})
   -p, --port <port>         Local proxy port (default: ${PORT})
       --pool-size <n>       Proxy worker pool size, 1-16 (default: ${DEFAULT_POOL}; auto-grows
-                            when the tool's own thread flag, e.g. pdf2zh -t 8, asks for more)
+                            when the tool's own thread flag, e.g. pdf2zh-next --qps 8, asks for more)
 
 Speed options (all opt-in; unverified against real models, see README "Going faster"):
-      --fast                Apply the tool's tuned profile (e.g. pdf2zh gets -t 16 and a 16-worker pool).
+      --fast                Apply the tool's tuned profile (e.g. pdf2zh-next gets --qps 16 --pool-max-workers 16).
                             Flags you pass yourself always win; tools without a profile run unchanged.
       --batch <n>           Pass a batch size to tools that have a batch option (ignored with a message otherwise)
       --parallel-files <n>  Several input files, one run each, up to n at once through the same proxy

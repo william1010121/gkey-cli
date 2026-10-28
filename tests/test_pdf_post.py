@@ -32,12 +32,12 @@ def test_parse_pages():
 
 
 def _fitz_python():
-    """Interpreter that has PyMuPDF: this one, or pdf2zh's own tool environment."""
+    """Interpreter that has PyMuPDF: this one, or pdf2zh-next's own tool environment."""
     try:
         import fitz  # noqa: F401
         return sys.executable
     except ImportError:
-        return catalog.pdf2zh_python("pdf2zh")
+        return catalog.pdf2zh_python("pdf2zh_next")
 
 
 def test_merge_zh_then_en_order(tmp_path):

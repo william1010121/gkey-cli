@@ -15,6 +15,7 @@ LOCAL_API_KEY = "gkey-local-placeholder"
 
 DEFAULT_POOL_SIZE = 4
 MAX_POOL_SIZE = 16
+PDF2ZH_NEXT_FAST_QPS = 16  # pdf2zh-next --qps / --pool-max-workers gkey injects when the user gives neither
 
 
 def gkey_home() -> pathlib.Path:
@@ -49,7 +50,7 @@ def redact_text(text: str) -> str:
 # Per-tool flag that controls the tool's own concurrency. Best effort: when one of
 # these is present we size the proxy pool to match so the tool is not starved.
 CONCURRENCY_FLAGS = {
-    "pdf2zh": ("-t", "--thread"),
+    "pdf2zh-next": ("--qps", "--pool-max-workers"),
     "babeldoc": ("-q", "--qps", "--pool-max-workers"),
     # gpt-subtrans has no thread flag (its MAX_THREADS is GUI-only), so no entry
     "marker_single": ("--max_concurrency",),
@@ -64,6 +65,8 @@ def detect_concurrency(tool_id: str, args: Sequence[str]) -> Optional[int]:
     flags = CONCURRENCY_FLAGS.get(tool_id)
     if not flags:
         return None
+    if tool_id == "pdf2zh-next" and not any(a.split("=", 1)[0] in flags for a in args):
+        return PDF2ZH_NEXT_FAST_QPS  # catalog injects --qps/--pool-max-workers 16 when neither is given
     found: Optional[int] = None
     args = list(args)
     for i, a in enumerate(args):

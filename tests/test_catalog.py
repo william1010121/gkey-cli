@@ -19,37 +19,69 @@ def adapt(tool, args, monkeypatch=None, tmp_path=None):
     return catalog.adapt_args(catalog.TOOL_BY_ID[tool], args, PORT, MODEL, env), env
 
 
-def test_pdf2zh_gets_service_once():
-    args, env = adapt("pdf2zh", ["paper.pdf", "-t", "8"])
-    assert args == ["paper.pdf", "-t", "8", "-s", "openai", "-lo", "zh-TW"]
+def test_pdf2zh_next_injects_openai_flags_once():
+    args, env = adapt("pdf2zh-next", ["paper.pdf"])
+    assert args == [
+        "paper.pdf", "--openai", "--openai-model", MODEL, "--openai-base-url", f"http://127.0.0.1:{PORT}/v1",
+        "--openai-api-key", LOCAL_API_KEY, "--lang-out", "zh-TW", "--qps", "16", "--pool-max-workers", "16",
+    ]
     assert env["GKEY_PDF2ZH_LAYOUT"] == "zh-then-en"
-    args, _ = adapt("pdf2zh", ["paper.pdf", "-s", "google"])
-    assert args.count("-s") == 1 and "openai" not in args
+    args, _ = adapt("pdf2zh-next", ["paper.pdf", "--deepseek"])
+    assert "--openai" not in args and "--openai-base-url" not in args
+    args, _ = adapt("pdf2zh-next", ["paper.pdf", "--openai", "--openai-model", "x"])
+    assert args.count("--openai") == 1 and args.count("--openai-model") == 1 and args.count("--openai-base-url") == 1
 
 
-def test_pdf2zh_target_language_default_and_override():
-    args, _ = adapt("pdf2zh", ["paper.pdf"])
-    assert args[args.index("-lo") + 1] == "zh-TW"
-    for given in (["-lo", "ja"], ["--lang-out", "ja"], ["--lang-out=ja"], ["-lo=ja"]):
-        args, _ = adapt("pdf2zh", ["paper.pdf"] + given)
+def test_pdf2zh_alias_maps_to_next():
+    assert catalog.TOOL_BY_ID["pdf2zh"] is catalog.TOOL_BY_ID["pdf2zh-next"]
+    assert catalog.TOOL_BY_ID["pdf2zh_next"].binary == "pdf2zh_next"
+    assert "pdf2zh" not in catalog.TOOL_BY_ID["pdf2zh-next"].aliases  # the old binary must not count as installed
+
+
+def test_pdf2zh_next_concurrency_user_wins():
+    args, _ = adapt("pdf2zh-next", ["paper.pdf", "--qps", "8"])
+    assert args.count("--qps") == 1 and "--pool-max-workers" not in args
+    args, _ = adapt("pdf2zh-next", ["paper.pdf", "--pool-max-workers=3"])
+    assert "--qps" not in args and "--pool-max-workers=3" in args
+
+
+def test_pdf2zh_next_target_language_default_and_override():
+    args, _ = adapt("pdf2zh-next", ["paper.pdf"])
+    assert args[args.index("--lang-out") + 1] == "zh-TW"
+    for given in (["--lang-out", "ja"], ["--lang-out=ja"]):
+        args, _ = adapt("pdf2zh-next", ["paper.pdf"] + given)
         assert "zh-TW" not in args
-        assert sum(a.startswith(("-lo", "--lang-out")) for a in args) == 1
+        assert sum(a.startswith("--lang-out") for a in args) == 1
+
+
+def test_pdf2zh_next_pages_only_translated():
+    args, _ = adapt("pdf2zh-next", ["paper.pdf", "--pages", "1-5"])
+    assert "--only-include-translated-page" in args
+    args, _ = adapt("pdf2zh-next", ["paper.pdf"])
+    assert "--only-include-translated-page" not in args
 
 
 def test_pdf2zh_layout_flag_is_consumed():
-    args, env = adapt("pdf2zh", ["paper.pdf", "--layout", "dual"])
+    args, env = adapt("pdf2zh-next", ["paper.pdf", "--layout", "dual"])
     assert "--layout" not in args and "dual" not in args and env["GKEY_PDF2ZH_LAYOUT"] == "dual"
-    args, env = adapt("pdf2zh", ["--layout=zh-then-en", "paper.pdf"])
+    args, env = adapt("pdf2zh-next", ["--layout=zh-then-en", "paper.pdf"])
     assert args[0] == "paper.pdf" and env["GKEY_PDF2ZH_LAYOUT"] == "zh-then-en"
     with pytest.raises(SystemExit):
-        adapt("pdf2zh", ["paper.pdf", "--layout", "weird"])
+        adapt("pdf2zh-next", ["paper.pdf", "--layout", "weird"])
 
 
 def test_parse_pdf2zh_args():
-    info = catalog.parse_pdf2zh_args(["a b.pdf", "-p", "1-3", "-t", "8", "-o", "out", "-lo", "zh-TW", "-s", "openai", "c.pdf"])
+    info = catalog.parse_pdf2zh_args(
+        ["a b.pdf", "--pages", "1-3", "--qps", "8", "--output", "out", "--lang-out", "zh-TW", "--openai", "--no-dual", "c.pdf"]
+    )
     assert info["files"] == ["a b.pdf", "c.pdf"]
     assert (info["output"], info["pages"], info["lang_out"], info["lang_in"]) == ("out", "1-3", "zh-TW", "en")
     assert catalog.parse_pdf2zh_args(["--output=x", "--pages=2", "p.pdf"])["output"] == "x"
+    assert catalog.parse_pdf2zh_args(["--pages", "p.pdf"])["files"] == ["p.pdf"]  # missing value: file kept
+
+
+def test_pdf2zh_output_paths():
+    assert catalog.pdf2zh_output_paths("o", "paper", "zh-TW") == ("o/paper.zh-TW.mono.pdf", "o/paper.zh-TW.dual.pdf")
 
 
 def test_babeldoc_positional_pdf_rewritten():
@@ -155,13 +187,21 @@ def test_help_flags_pass_through(monkeypatch):
     seen = {}
     monkeypatch.setattr(catalog.os, "execvp", lambda cmd, argv: seen.update(argv=argv))
     monkeypatch.setattr(catalog, "install_tool", lambda spec: True)
+    catalog.adapt_and_exec(PORT, MODEL, ["pdf2zh-next", "--help"])
+    assert seen["argv"] == ["pdf2zh_next", "--help"]
+
+
+def test_legacy_alias_prints_notice(monkeypatch, capsys):
+    monkeypatch.setattr(catalog.os, "execvp", lambda cmd, argv: None)
+    monkeypatch.setattr(catalog, "install_tool", lambda spec: True)
     catalog.adapt_and_exec(PORT, MODEL, ["pdf2zh", "--help"])
-    assert seen["argv"] == ["pdf2zh", "--help"]
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1 and "pdf2zh-next" in err
 
 
 def test_poolsize_cli():
     out = subprocess.run(
-        [sys.executable, str(ROOT / "catalog.py"), "poolsize", "4", "-", "pdf2zh", "p.pdf", "-t", "8"],
+        [sys.executable, str(ROOT / "catalog.py"), "poolsize", "4", "-", "pdf2zh", "p.pdf", "--qps", "8"],
         stdout=subprocess.PIPE, universal_newlines=True, check=True,
     ).stdout.strip()
     assert out == "8"
