@@ -22,10 +22,15 @@ import logging
 import os
 import pathlib
 import shutil
+import sys
 import tempfile
 import time
 import uuid
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Optional
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from gkey_common import MAX_POOL_SIZE, gkey_home  # noqa: E402
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -33,20 +38,32 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 import uvicorn
 
-# Official Google Antigravity Python SDK imports
-import google.antigravity as ag
-from google.antigravity import (
-    Agent,
-    CapabilitiesConfig,
-    CustomSystemInstructions,
-    LocalAgentConfig,
-)
+# The Google Antigravity Python SDK is optional: without it only the `agy` backend works.
+try:
+    from google.antigravity import (
+        Agent,
+        CapabilitiesConfig,
+        CustomSystemInstructions,
+        LocalAgentConfig,
+    )
+
+    SDK_AVAILABLE = True
+except ImportError:  # pragma: no cover - depends on the environment
+    SDK_AVAILABLE = False
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("gkey-proxy")
+
+# Overall deadline for one agy request, and for starting one worker (seconds).
+REQUEST_TIMEOUT = float(os.environ.get("GKEY_TIMEOUT", "300"))
+START_TIMEOUT = float(os.environ.get("GKEY_START_TIMEOUT", "60"))
+
+
+def workspace_root() -> pathlib.Path:
+    return gkey_home() / "workspace"
 
 AGY_MODELS = {
     "gemini-4-argon-medium",
@@ -76,7 +93,7 @@ def format_openai_messages(messages: list[dict[str, Any]]) -> tuple[str, str]:
     """Extracts system instructions and formats conversation messages into a prompt."""
     system_parts: list[str] = []
     conv_parts: list[str] = []
-    img_dir = pathlib.Path("/tmp/gkey-agy-workspace")
+    img_dir = workspace_root() / "agy"
     img_dir.mkdir(parents=True, exist_ok=True)
 
     for msg in messages:
@@ -177,7 +194,7 @@ class SDKBackend:
     def __init__(self, default_model: str, concurrency: int = 4):
         self.default_model = default_model
         self.semaphore = asyncio.Semaphore(concurrency)
-        self.workspace_dir = pathlib.Path("/tmp/gkey-sdk-workspace")
+        self.workspace_dir = workspace_root() / "sdk"
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
 
     def resolve_model(self, requested: str | None) -> str:
@@ -207,6 +224,10 @@ class SDKBackend:
             if schema_obj:
                 response_schema = json.dumps(schema_obj)
 
+        if not SDK_AVAILABLE:
+            raise RuntimeError(
+                "google-antigravity is not installed; use --backend agy or `pip install google-antigravity`"
+            )
         config = LocalAgentConfig(
             model=target_model,
             system_instructions=CustomSystemInstructions(text=effective_system),
@@ -263,11 +284,16 @@ class AgyStreamWorker:
         )
         assert self.proc.stdout is not None
         # Wait for the `{"event":"init", ...}` line so the worker is 100% hot
-        line = await self.proc.stdout.readline()
+        try:
+            line = await asyncio.wait_for(self.proc.stdout.readline(), timeout=START_TIMEOUT)
+        except asyncio.TimeoutError:
+            await self.close()
+            raise RuntimeError(f"agy worker did not initialise within {START_TIMEOUT:.0f}s")
         if not line:
             stderr_bytes = await self.proc.stderr.read() if self.proc.stderr else b""
+            await self.close()
             raise RuntimeError(
-                f"agy worker exited before init: {stderr_bytes.decode('utf-8', 'replace')}"
+                f"agy worker exited before init: {stderr_bytes.decode('utf-8', 'replace')[:500]}"
             )
         self.ready = True
 
@@ -301,13 +327,14 @@ class AgyCLIBackend:
         self.effort = effort
         self.pool_size = pool_size
         self.max_turns_per_worker = max_turns_per_worker
-        self.workspace_dir = pathlib.Path("/tmp/gkey-agy-workspace")
+        self.workspace_dir = workspace_root() / "agy"
         self._setup_isolated_workspace()
         self.pool: asyncio.Queue[AgyStreamWorker] = asyncio.Queue()
         self.semaphore = asyncio.Semaphore(pool_size)
         self._spawn_lock = asyncio.Lock()
         self._bg_tasks: set[asyncio.Task[Any]] = set()
         self._closed = False
+        self.last_warm_error: Optional[str] = None
 
     def _setup_isolated_workspace(self) -> None:
         agents_dir = self.workspace_dir / ".agents" / "agents"
@@ -348,6 +375,7 @@ class AgyCLIBackend:
         task.add_done_callback(self._bg_tasks.discard)
 
     async def _create_and_enqueue_worker(self) -> None:
+        """Background warm-up. Failures are recorded; the next request surfaces them."""
         try:
             async with self._spawn_lock:
                 if self._closed:
@@ -359,30 +387,26 @@ class AgyCLIBackend:
             if self._closed:
                 await worker.close()
                 return
-            logger.info("agy worker ready (pool_size=%d)", self.pool.qsize() + 1)
+            self.last_warm_error = None
+            logger.info("agy worker ready (warm=%d)", self.pool.qsize() + 1)
             await self.pool.put(worker)
         except Exception as e:
+            self.last_warm_error = str(e)
             logger.warning("Failed to pre-warm agy worker: %s", e)
 
-    async def _acquire_worker(self, model: str) -> AgyStreamWorker:
+    async def _acquire_worker(self, model: str) -> "AgyStreamWorker":
+        """Take a healthy warm worker, or start one directly.
+
+        Never waits on the warm queue: if warm-up failed, starting a worker here
+        raises the real error to the caller instead of hanging forever.
+        """
         if model == self.default_model:
             while not self.pool.empty():
-                worker = await self.pool.get()
+                worker = self.pool.get_nowait()
                 if worker.proc and worker.proc.returncode is None and worker.ready:
                     return worker
                 await worker.close()
-
-            if not self._bg_tasks:
-                self._schedule_replenish()
-
-            worker = await self.pool.get()
-            if worker.proc and worker.proc.returncode is None and worker.ready:
-                return worker
-            await worker.close()
-
-        worker = AgyStreamWorker(
-            self.agy_bin, self.workspace_dir, model, self.effort
-        )
+        worker = AgyStreamWorker(self.agy_bin, self.workspace_dir, model, self.effort)
         await worker.start()
         return worker
 
@@ -401,8 +425,6 @@ class AgyCLIBackend:
                 target_model != self.default_model
                 or (worker.turns + 1) >= self.max_turns_per_worker
             )
-            if recycle and target_model == self.default_model:
-                self._schedule_replenish()
 
             try:
                 assert worker.proc is not None
@@ -429,10 +451,28 @@ class AgyCLIBackend:
                 worker.turns += 1
 
                 yielded_any = False
+                got_result = False
+                deadline = time.monotonic() + REQUEST_TIMEOUT
                 while True:
-                    line = await worker.proc.stdout.readline()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(f"agy request exceeded {REQUEST_TIMEOUT:.0f}s deadline")
+                    try:
+                        line = await asyncio.wait_for(worker.proc.stdout.readline(), timeout=remaining)
+                    except asyncio.TimeoutError:
+                        raise TimeoutError(f"agy request exceeded {REQUEST_TIMEOUT:.0f}s deadline")
                     if not line:
-                        break
+                        # EOF before a result event: the worker died. This is an error, not success.
+                        stderr_tail = b""
+                        if worker.proc.stderr is not None:
+                            try:
+                                stderr_tail = await asyncio.wait_for(worker.proc.stderr.read(2000), timeout=0.5)
+                            except Exception:
+                                pass
+                        raise RuntimeError(
+                            "agy worker closed its output before returning a result"
+                            + (f": {stderr_tail.decode('utf-8', 'replace').strip()}" if stderr_tail else "")
+                        )
                     try:
                         ev = json.loads(line.decode("utf-8", "replace"))
                     except json.JSONDecodeError:
@@ -449,17 +489,21 @@ class AgyCLIBackend:
                     elif ev_type == "result":
                         res = ev.get("result", {})
                         if res.get("status") == "ERROR":
-                            err_msg = res.get("error", "Unknown agy error")
-                            raise RuntimeError(err_msg)
+                            raise RuntimeError(res.get("error", "Unknown agy error"))
                         if not yielded_any and res.get("response"):
                             yield res["response"]
+                        got_result = True
                         break
+                if not got_result:  # pragma: no cover - loop only exits via break or raise
+                    raise RuntimeError("agy returned no result")
             except Exception:
                 recycle = True
                 raise
             finally:
                 if recycle:
                     asyncio.create_task(worker.close())
+                    if target_model == self.default_model:
+                        self._schedule_replenish()
                 else:
                     await self.pool.put(worker)
 
@@ -472,6 +516,8 @@ class AgyCLIBackend:
 
 def has_sdk_credentials() -> bool:
     """Checks whether GEMINI_API_KEY or Vertex AI credentials are set for the Python SDK."""
+    if not SDK_AVAILABLE:
+        return False
     if os.environ.get("GEMINI_API_KEY"):
         return True
     if os.environ.get("GOOGLE_CLOUD_PROJECT") and os.environ.get("GOOGLE_CLOUD_LOCATION"):
@@ -496,6 +542,8 @@ def create_app(
 
     def get_active_backend() -> tuple[str, SDKBackend | AgyCLIBackend]:
         if backend_mode == "sdk":
+            if not SDK_AVAILABLE:
+                raise RuntimeError("--backend sdk requires the google-antigravity package")
             return "sdk", sdk_backend
         if backend_mode == "agy":
             return "agy", agy_backend
@@ -529,7 +577,10 @@ def create_app(
                 "active_engine": name,
                 "default_model": default_model,
                 "effort": effort,
+                "pool_size": pool_size,
+                "sdk_available": SDK_AVAILABLE,
                 "warm_workers": agy_backend.pool.qsize() if name == "agy" else 0,
+                "last_warm_error": agy_backend.last_warm_error,
             }
         )
 
@@ -621,6 +672,8 @@ def create_app(
                         }
                     }
                     yield f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n".encode("utf-8")
+                    yield b"data: [DONE]\n\n"
+                    return
 
                 stop_chunk = {
                     "id": completion_id,
@@ -706,13 +759,20 @@ def create_app(
         if not input_text:
             return JSONResponse({"error": {"message": "input is required"}}, status_code=400)
 
+        if not shutil.which("say") or not shutil.which("afconvert"):
+            return JSONResponse(
+                {"error": {"message": "/v1/audio/speech is only available on macOS (needs `say`)"}},
+                status_code=501,
+            )
+
         with tempfile.TemporaryDirectory(prefix="gkey_tts_") as tmpdir:
             aiff_path = os.path.join(tmpdir, "out.aiff")
             m4a_path = os.path.join(tmpdir, "out.m4a")
             proc = await asyncio.create_subprocess_exec(
                 "say", "-o", aiff_path, input_text
             )
-            await proc.wait()
+            if await proc.wait() != 0:
+                return JSONResponse({"error": {"message": "`say` failed"}}, status_code=500)
             conv = await asyncio.create_subprocess_exec(
                 "afconvert", "-f", "mp4f", "-d", "aac", aiff_path, m4a_path
             )
@@ -764,7 +824,7 @@ def main() -> None:
         "--pool-size",
         type=int,
         default=int(os.environ.get("GKEY_POOL_SIZE", "4")),
-        help="Number of warm workers / concurrent requests",
+        help=f"Number of warm workers / concurrent requests (1-{MAX_POOL_SIZE})",
     )
     parser.add_argument(
         "--max-turns",
@@ -773,6 +833,13 @@ def main() -> None:
         help="Max turns per warm agy worker before recycling",
     )
     args = parser.parse_args()
+    args.pool_size = max(1, min(args.pool_size, MAX_POOL_SIZE))
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        logger.warning(
+            "Binding to %s exposes an UNAUTHENTICATED proxy beyond this machine. "
+            "Anyone who can reach it can spend your Antigravity quota.",
+            args.host,
+        )
 
     app = create_app(
         backend_mode=args.backend,
