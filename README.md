@@ -233,3 +233,14 @@ GitHub topic suggestions are in [TOPICS.md](TOPICS.md).
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+## Stay in your shell after picking a tool (zsh)
+
+Add this to `~/.zshrc`:
+
+```zsh
+eval "$(gkey init zsh)"
+```
+
+Then bare `gkey` opens the picker and leaves `gkey <tool> ` on your own prompt line, so you
+can add arguments with normal zsh completion and history, then press Enter.

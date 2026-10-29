@@ -18,6 +18,16 @@ const STDLIB_ONLY = new Set([
   "-h", "--help", "--list", "--env", "--status", "--stop", "--logs", "--install", "info", "help",
 ]);
 
+// `eval "$(gkey init zsh)"`: bare `gkey` picks a tool, then leaves `gkey <tool> ` on the zsh prompt.
+const ZSH_INIT = `gkey() {
+  if (( $# )); then command gkey "$@"; return; fi
+  local f; f=$(mktemp) || return
+  GKEY_PICK_FILE="$f" command gkey
+  local cmd; cmd=$(<"$f"); rm -f "$f"
+  [[ -n "$cmd" ]] && print -z -- "$cmd"
+}
+`;
+
 function die(msg) {
   process.stderr.write(`[gkey] ${msg}\n`);
   process.exit(1);
@@ -74,6 +84,10 @@ function main() {
     die("Windows is not supported natively. Please run gkey inside WSL2 (Ubuntu): wsl --install");
   }
   const args = process.argv.slice(2);
+  if (args[0] === "init" && args[1] === "zsh") {
+    process.stdout.write(ZSH_INIT);
+    return;
+  }
   const python = findPython();
   if (!python) die("Python 3.9+ is required but was not found. Install it from https://www.python.org/ or your package manager.");
 

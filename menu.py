@@ -256,6 +256,13 @@ def main() -> None:
     tool_id = pick_tool(tools)
     if not tool_id:
         return
+    pick_file = os.environ.get("GKEY_PICK_FILE")
+    if pick_file:
+        # Shell integration (`eval "$(gkey init zsh)"`): hand the choice back so the
+        # shell puts `gkey <tool> ` on its own prompt line instead of this script.
+        with open(pick_file, "w") as f:
+            f.write(f"gkey {tool_id} ")
+        return
     argv = prompt_command(tool_id)
     if not argv:
         return
