@@ -244,3 +244,6 @@ eval "$(gkey init zsh)"
 
 Then bare `gkey` opens the picker and leaves `gkey <tool> ` on your own prompt line, so you
 can add arguments with normal zsh completion and history, then press Enter.
+
+On the first interactive run under zsh, gkey adds that line to `~/.zshrc` for you (once).
+Set `GKEY_NO_AUTO_INIT=1` to disable.

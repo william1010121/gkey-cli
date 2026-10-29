@@ -248,11 +248,39 @@ def prompt_command(tool_id: str) -> Optional[List[str]]:
         return None
 
 
+def ensure_zsh_integration() -> None:
+    """First interactive run under zsh: add `eval "$(gkey init zsh)"` to ~/.zshrc once.
+
+    A child process cannot edit its parent shell's prompt, so the integration has to live
+    in the shell. A stamp file means we never re-add it after the user removes it.
+    """
+    if os.environ.get("GKEY_PICK_FILE") or os.environ.get("GKEY_NO_AUTO_INIT") == "1":
+        return
+    if not os.path.basename(os.environ.get("SHELL", "")) == "zsh":
+        return
+    stamp = os.path.join(os.environ.get("GKEY_HOME") or os.path.expanduser("~/.gkey"), ".zsh-init-done")
+    if os.path.exists(stamp):
+        return
+    rc = os.path.join(os.environ.get("ZDOTDIR") or os.path.expanduser("~"), ".zshrc")
+    line = 'eval "$(gkey init zsh)"'
+    try:
+        existing = open(rc).read() if os.path.exists(rc) else ""
+        if "gkey init zsh" not in existing:
+            with open(rc, "a") as f:
+                f.write(("" if existing.endswith("\n") or not existing else "\n") + "# gkey: tool picker leaves the command on your prompt\n" + line + "\n")
+            sys.stderr.write(f"[gkey] zsh detected: added `{line}` to {rc}. Open a new terminal (or run `source {rc}`) and the picker will stay in zsh.\n")
+        os.makedirs(os.path.dirname(stamp), exist_ok=True)
+        open(stamp, "w").close()
+    except OSError:
+        pass
+
+
 def main() -> None:
     tools = catalog.TOOLS
     if not is_interactive():
         numbered_fallback(tools)
         return
+    ensure_zsh_integration()
     tool_id = pick_tool(tools)
     if not tool_id:
         return
